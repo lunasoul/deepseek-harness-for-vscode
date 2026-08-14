@@ -25,6 +25,7 @@ import {
   projectionPermissions,
   projectionPlan,
   projectionTitle,
+  projectionTokenUsage,
   sessionListItem,
   type CommandEntry,
   type HarnessWorkbenchState,
@@ -124,6 +125,7 @@ export class HarnessGatewayService implements vscode.Disposable {
   async snapshot(): Promise<HarnessWorkbenchState> {
     const apiKey = await this.credentials.getApiKey()
     const hasApiKey = apiKey !== undefined && apiKey.trim() !== ''
+    const tokenUsage = projectionTokenUsage(this.projections.tokenUsage)
     const summaries = this.orderedSummaries().map(sessionListItem)
     const activeSummary = this.activeSessionId === undefined ? undefined : this.summaries.get(this.activeSessionId)
     const projected = projectConversation(this.entries)
@@ -161,6 +163,7 @@ export class HarnessGatewayService implements vscode.Disposable {
       commands: this.commands,
       ...(plan === undefined ? {} : { plan }),
       ...(goal === undefined ? {} : { goal }),
+      ...(tokenUsage === undefined ? {} : { tokenUsage }),
     }
     return {
       phase: this.phase,
@@ -230,6 +233,30 @@ export class HarnessGatewayService implements vscode.Disposable {
 
   /** Opens ordinary sessions directly and resolves subagent transport through its direct parent. */
   async openSession(sessionId: string): Promise<void> {
+    await this.openSessionWithRetry(sessionId, OPEN_SESSION_ATTEMPTS)
+  }
+
+  /**
+   * The gateway serves the HTTP API before its session store has finished
+   * loading persisted sessions; calling session APIs in that window yields a
+   * transient `session "…" not found (not attached)` from skills/history.
+   * Retry with backoff so the first auto-opened session at startup does not
+   * fail the whole workbench (observed on Windows, first run after reload).
+   */
+  private async openSessionWithRetry(sessionId: string, attempts: number): Promise<void> {
+    try {
+      await this.openSessionOnce(sessionId)
+    } catch (cause) {
+      if (attempts > 0 && isTransientSessionError(cause)) {
+        await sleep(OPEN_SESSION_RETRY_DELAY_MS)
+        await this.openSessionWithRetry(sessionId, attempts - 1)
+        return
+      }
+      throw cause
+    }
+  }
+
+  private async openSessionOnce(sessionId: string): Promise<void> {
     let summary = this.summaries.get(sessionId)
     if (summary === undefined) {
       await this.refreshSessionList()
@@ -270,12 +297,14 @@ export class HarnessGatewayService implements vscode.Disposable {
     text: string,
     mode: 'queue' | 'steer' = 'queue',
     images: readonly PromptImage[] = [],
+    selection?: PromptSelection,
   ): Promise<void> {
     const normalized = text.trim()
-    if (normalized === '' && images.length === 0) return
+    if (normalized === '' && images.length === 0 && selection === undefined) return
     if (this.activeSessionId === undefined) await this.createSession()
     const sessionId = this.requireActiveSession()
     const content: PromptContentPart[] = [
+      ...(selection === undefined ? [] : [selectionPart(selection)]),
       ...(normalized === '' ? [] : [{ type: 'text' as const, text: normalized }]),
       ...images.map((image) => ({
         type: 'image' as const,
@@ -692,6 +721,28 @@ export interface PromptImage {
   readonly name?: string
 }
 
+/** A snapshot of the active editor selection attached as prompt context. */
+export interface PromptSelection {
+  readonly file?: string
+  readonly text: string
+  readonly startLine?: number
+  readonly endLine?: number
+  readonly tooLong?: boolean
+}
+
+function selectionPart(selection: PromptSelection): PromptContentPart {
+  const name = selection.file === undefined ? '选区' : selection.file.split(/[\\/]/u).pop() ?? '选区'
+  const ext = name.includes('.') ? name.split('.').pop() ?? '' : ''
+  const range = selection.startLine !== undefined && selection.endLine !== undefined
+    ? ` (${selection.startLine}-${selection.endLine} 行)`
+    : ''
+  const truncated = selection.tooLong === true ? '（已截断）' : ''
+  return {
+    type: 'text',
+    text: `[选区: ${name}${range}${truncated}]\n\`\`\`${ext}\n${selection.text}\n\`\`\``,
+  }
+}
+
 function valueOf<T>(response: RpcResponse<T>): T {
   if (!response.result.ok) throw new Error(response.result.error.message)
   return response.result.value
@@ -711,6 +762,18 @@ function stripQuestionTransport(value: PendingQuestionRecord): PendingQuestionVi
 
 function errorMessage(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause)
+}
+
+const OPEN_SESSION_ATTEMPTS = 10
+const OPEN_SESSION_RETRY_DELAY_MS = 800
+
+/** True for the transient gateway-startup "session not attached" failure. */
+function isTransientSessionError(cause: unknown): boolean {
+  return errorMessage(cause).includes('not found (not attached)')
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 function recordValue(value: unknown): Record<string, unknown> {

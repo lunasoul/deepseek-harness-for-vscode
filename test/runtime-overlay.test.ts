@@ -10,6 +10,7 @@ describe('Harness Web profile overlay', () => {
       provider: 'deepseek-official',
       permissionMode: 'workspace-write',
       baseUrl: undefined,
+      autoAttachSelection: true,
     })
     expect(overlay).toContain('reasoningEffort: max')
     expect(overlay).toContain('model: deepseek-v4-pro')
@@ -24,6 +25,7 @@ describe('Harness Web profile overlay', () => {
       provider: 'custom: route',
       permissionMode: 'read-only',
       baseUrl: 'https://example.test',
+      autoAttachSelection: false,
     })
     expect(overlay).toContain('thinking: disabled')
     expect(overlay).toContain('provider: "custom: route"')

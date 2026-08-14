@@ -94,6 +94,14 @@
         }
       ]
     },
+    "keybindings": [
+      {
+        "command": "deepseekHarness.openChat",
+        "key": "ctrl+alt+h",
+        "mac": "cmd+alt+h",
+        "when": "!inChat"
+      }
+    ],
     "configuration": {
       "title": "DeepSeek Harness",
       "properties": {
@@ -172,6 +180,11 @@
           ],
           "default": "workspace-write",
           "description": "Harness 工具的文件访问与审批默认策略。"
+        },
+        "deepseekHarness.autoAttachSelection": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "发送消息时自动把当前编辑器选中的代码附加为上下文（等同自动点击“⬒ 选区”）。设为 `false` 后仅通过“⬒ 选区”按钮手动附加。"
         }
       }
     }
@@ -192,5 +205,16 @@
     "@deepseek-ai/dsh": "0.1.0-rc.6",
     "node": "22.22.3",
     "ws": "^8.21.3"
+  },
+  "allowScripts": {
+    "node@22.22.3": true,
+    "@deepseek-ai/dsh-subprocess-local@0.1.0-rc.6": true,
+    "esbuild@0.25.12": true,
+    "node-pty@1.1.0": true,
+    "koffi@3.1.4": true,
+    "keytar@7.9.0": true,
+    "protobufjs@7.6.5": true,
+    "@vscode/vsce-sign@2.0.9": true,
+    "@google/genai@1.52.0": true
   }
 }

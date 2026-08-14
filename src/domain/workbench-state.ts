@@ -90,6 +90,7 @@ export interface ActiveSessionView {
   readonly commands?: readonly CommandEntry[]
   readonly plan?: { readonly active: boolean; readonly pending: boolean }
   readonly goal?: GoalView
+  readonly tokenUsage?: TokenUsageView
 }
 
 export type SubagentView = {
@@ -145,6 +146,25 @@ export function projectionCommands(value: unknown): readonly CommandEntry[] {
   }
   hosts.sort((left, right) => left.name < right.name ? -1 : 1)
   return [...hosts, ...EXTENSION_COMMANDS]
+}
+
+export interface TokenUsageView {
+  readonly uncachedInputTokens: number
+  readonly outputTokens: number
+  readonly cacheReadTokens: number
+  readonly cacheWriteTokens: number
+}
+
+/** Projects the harness `tokenUsage` session projection (0 when absent). */
+export function projectionTokenUsage(value: unknown): TokenUsageView | undefined {
+  if (!isRecord(value)) return undefined
+  const uncachedInputTokens = value.uncachedInputTokens
+  const outputTokens = value.outputTokens
+  const cacheReadTokens = value.cacheReadTokens
+  const cacheWriteTokens = value.cacheWriteTokens
+  if (typeof uncachedInputTokens !== 'number' || typeof outputTokens !== 'number'
+    || typeof cacheReadTokens !== 'number' || typeof cacheWriteTokens !== 'number') return undefined
+  return { uncachedInputTokens, outputTokens, cacheReadTokens, cacheWriteTokens }
 }
 
 export interface GoalView {

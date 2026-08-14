@@ -9,6 +9,9 @@
 - **原生 VS Code 会话工作台** — 直接在侧边栏完成全部交互
 - **完整会话管理** — 持久化历史、新建 / 切换 / 重命名 / 分支会话
 - **多轮对话** — 流式回复、运行中排队、停止生成、历史分页
+- **Markdown 渲染** — 代码块（带一键复制）、标题、列表、引用与行内格式
+- **编辑器选区上下文** — 发送时自动附加当前选中代码（可设置关闭），也可用“⬒ 选区”按钮手动插入
+- **快捷键** — `Ctrl+Alt+H`（macOS `Cmd+Alt+H`）打开工作台
 - **斜杠命令** — 输入 `/` 弹出官方命令菜单（`/permission`、`/plan`、`/goal`、`/compact`、`/feedback`），支持过滤与键盘导航；`/model`、`/reasoning`、`/preset` 可直接切换会话设置
 - **透明推理过程** — 折叠推理步骤、工具调用与结果时间线
 - **Harness 原生能力** — 审批请求、结构化用户问题、Todo 计划、Skills 快捷调用、后台任务状态
@@ -55,9 +58,11 @@
 | `deepseekHarness.provider` | `deepseek-official` | Harness 模型提供方路由 |
 | `deepseekHarness.baseUrl` | 空 | 可选 DeepSeek API Base URL，留空使用官方默认地址 |
 | `deepseekHarness.permissionMode` | `workspace-write` | 文件与 Shell 权限默认策略：`read-only` / `workspace-write` / `danger-full-access` |
+| `deepseekHarness.autoAttachSelection` | `true` | 发送消息时自动附加当前编辑器选中的代码作为上下文；关闭后仅通过“⬒ 选区”按钮手动附加 |
 
 - 模型与推理等级会在会话中通过 Gateway 即时更新；Agent Preset 可更新空白会话，并作为后续新会话的默认值。
 - API Key 使用 `machine` 作用域，**不会**写入项目 `.vscode/settings.json`。它是明文存储，请勿提交或同步包含密钥的设置文件。
+- 自动附加选区：发送时读取当前编辑器选区（最长 16 KB，超长自动截断）并作为消息的第一段上下文发送；若消息里已手动嵌入同一文件的选区（“⬒ 选区”或 `[选区: ` 标记）则不会重复附加。
 
 ### 命令
 
@@ -96,6 +101,10 @@ npm test              # 单元测试
 npm run compile       # 编译
 npm run package       # 打包 VSIX
 ```
+
+- `npm run package` 在 Windows / macOS / Linux 均可直接运行（`scripts/package-vsix.mjs` 通过当前 Node 直接调用 vsce，不再依赖平台 shim）。
+- npm ≥ 11 会拦截依赖安装脚本：仓库 `package.json` 已带 `allowScripts` 白名单（node、node-pty、koffi、esbuild 等），`npm ci` 会自动放行。
+- 多平台构建与发布已配置 GitHub Actions（`.github/workflows/release.yml`）：推送 `v*` 标签或手动触发，产出 darwin / linux / win32 各架构 VSIX 并附加到 Release（win32-arm64 需自托管 runner）。
 
 分层架构与分发取舍详见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
 

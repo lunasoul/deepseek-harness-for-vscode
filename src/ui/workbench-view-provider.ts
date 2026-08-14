@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto'
 import * as vscode from 'vscode'
 import type { ConfigurationService } from '../config/configuration.js'
 import { AGENT_PRESET_OPTIONS, MODEL_OPTIONS, REASONING_OPTIONS } from '../domain/options.js'
-import type { HarnessGatewayService } from '../gateway/harness-gateway-service.js'
+import type { HarnessGatewayService, PromptSelection } from '../gateway/harness-gateway-service.js'
 
 export interface WorkbenchViewActions {
   readonly setApiKey: () => Promise<void>
@@ -110,6 +110,7 @@ export class WorkbenchViewProvider implements vscode.WebviewViewProvider, vscode
           typeof value.text === 'string' ? value.text : '',
           value.mode === 'steer' ? 'steer' : 'queue',
           promptImages(value.images),
+          autoSelection(typeof value.text === 'string' ? value.text : ''),
         )
         break
       case 'cancel':
@@ -131,6 +132,20 @@ export class WorkbenchViewProvider implements vscode.WebviewViewProvider, vscode
       case 'setPermission':
         await this.gateway.selectPermission(requiredString(value, 'value'))
         break
+      case 'openExternal': {
+        // Only http(s) links from rendered markdown are opened, never local
+        // paths or custom schemes.
+        const raw = typeof value.url === 'string' ? value.url : ''
+        const uri = safeExternalUri(raw)
+        if (uri !== undefined) void vscode.env.openExternal(uri)
+        break
+      }
+      case 'attachSelection': {
+        // Reads the active editor selection so the webview can attach it to
+        // the prompt as explicit context.
+        await this.view?.webview.postMessage({ type: 'selectionAttached', ...activeEditorSelection() })
+        break
+      }
       case 'loadCommands':
         await this.gateway.refreshCommands()
         break
@@ -313,6 +328,7 @@ export class WorkbenchViewProvider implements vscode.WebviewViewProvider, vscode
         <div class="composer-bar">
           <button id="attach" class="text-button" title="添加图片">＋ 图片</button>
           <input id="image-input" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple>
+          <button id="attach-selection" class="text-button" title="附加当前编辑器选区到消息">⬒ 选区</button>
           <button id="details-toggle" class="text-button" title="计划、Skills 与后台任务">上下文</button>
           <select id="permission" class="permission-select hidden" title="Harness 文件和命令权限"></select>
           <span id="composer-status" class="composer-status"></span>
@@ -382,6 +398,65 @@ function isImageType(value: unknown): value is 'image/png' | 'image/jpeg' | 'ima
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
+}
+
+const MAX_SELECTION_CHARS = 16_000
+
+/** Only ever hands out http(s) URLs to the external browser. */
+function safeExternalUri(raw: string): vscode.Uri | undefined {
+  try {
+    const uri = vscode.Uri.parse(raw)
+    if (uri.scheme === 'http' || uri.scheme === 'https') return uri
+  } catch {
+    // Malformed URL: ignore.
+  }
+  return undefined
+}
+
+/** Snapshot of the active editor selection, truncated for prompt embedding. */
+function activeEditorSelection(): {
+  readonly file?: string
+  readonly text?: string
+  readonly startLine?: number
+  readonly endLine?: number
+  readonly tooLong?: boolean
+} {
+  const editor = vscode.window.activeTextEditor
+  if (editor === undefined || editor.selection.isEmpty) return {}
+  const { document, selection } = editor
+  const text = document.getText(selection)
+  const startLine = selection.start.line + 1
+  const endLine = selection.end.line + 1
+  if (text.length > MAX_SELECTION_CHARS) {
+    return { file: document.uri.fsPath, text: text.slice(0, MAX_SELECTION_CHARS), startLine, endLine, tooLong: true }
+  }
+  return { file: document.uri.fsPath, text, startLine, endLine }
+}
+
+/**
+ * Auto-attached selection context for the message being sent. Skips when the
+ * setting is off, when the editor has no selection, or when the user already
+ * embedded that selection manually (via the ⬒ 选区 button), which would
+ * otherwise duplicate the code in the prompt.
+ */
+function autoSelection(text: string): PromptSelection | undefined {
+  const selection = activeEditorSelection()
+  if (selection.text === undefined) return undefined
+  if (hasEmbeddedSelection(text, selection.file)) return undefined
+  return {
+    text: selection.text,
+    ...(selection.file === undefined ? {} : { file: selection.file }),
+    ...(selection.startLine === undefined ? {} : { startLine: selection.startLine }),
+    ...(selection.endLine === undefined ? {} : { endLine: selection.endLine }),
+    ...(selection.tooLong === true ? { tooLong: true } : {}),
+  }
+}
+
+function hasEmbeddedSelection(text: string, file: string | undefined): boolean {
+  if (file === undefined) return false
+  const name = file.split(/[\\/]/u).pop() ?? ''
+  if (name === '') return false
+  return text.includes(`[来自 ${name}`) || text.includes(`[选区: ${name}`)
 }
 
 function goalAction(value: unknown): 'pause' | 'resume' | 'complete' | 'clear' {

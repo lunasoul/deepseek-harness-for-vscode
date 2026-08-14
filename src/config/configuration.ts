@@ -21,6 +21,8 @@ export interface HarnessConfiguration {
   readonly provider: string
   readonly baseUrl: string | undefined
   readonly permissionMode: PermissionMode
+  /** Auto-attach the active editor selection as context when sending. */
+  readonly autoAttachSelection: boolean
 }
 
 /** Reads extension settings and reports changes that require a runtime restart. */
@@ -49,6 +51,7 @@ export class ConfigurationService implements vscode.Disposable {
       provider: nonEmpty(config.get<string>('provider'), 'deepseek-official'),
       baseUrl: baseUrl === '' ? undefined : baseUrl,
       permissionMode: permissionMode(config.get<string>('permissionMode')),
+      autoAttachSelection: config.get<boolean>('autoAttachSelection', true),
     }
   }
 
