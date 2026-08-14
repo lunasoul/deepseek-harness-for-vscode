@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { mkdir, writeFile } from 'node:fs/promises'
 import * as path from 'node:path'
@@ -162,17 +162,31 @@ export class HarnessHostRuntime implements vscode.Disposable {
       return
     }
     this.setState({ phase: 'stopping' })
-    child.kill('SIGTERM')
-    await new Promise<void>((resolve) => {
-      const timeout = setTimeout(() => {
-        child.kill('SIGKILL')
-        resolve()
-      }, STOP_TIMEOUT_MS)
-      child.once('exit', () => {
-        clearTimeout(timeout)
-        resolve()
-      })
-    })
+
+    // Attach the exit listener before signalling so a fast exit cannot race it.
+    const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()))
+    if (process.platform === 'win32') {
+      // On Windows SIGTERM is an immediate TerminateProcess of the direct child
+      // only; dsh's tool subprocesses (shells, background jobs) can outlive it.
+      // Kill the whole process tree via taskkill so nothing survives a reload.
+      try {
+        spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' })
+      } catch {
+        // taskkill is best-effort; the direct kill fallback below still applies.
+      }
+    } else {
+      // POSIX: graceful SIGTERM first, escalate to SIGKILL on timeout.
+      child.kill('SIGTERM')
+    }
+
+    const timeout = new Promise<boolean>((resolve) => setTimeout(() => resolve(true), STOP_TIMEOUT_MS))
+    const timedOut = await Promise.race([exited.then(() => false), timeout])
+    if (timedOut && child.exitCode === null) {
+      if (process.platform === 'win32') child.kill()
+      else child.kill('SIGKILL')
+      // The exit handler already settled the runtime state; do not await the
+      // (already-resolving) exit event here to avoid a hang if the kill fails.
+    }
     this.setState({ phase: 'idle' })
   }
 
