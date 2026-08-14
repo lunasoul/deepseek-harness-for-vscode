@@ -17,10 +17,15 @@ if (target === undefined) throw new Error(`暂不支持为 ${key} 打包平台 V
 const executable = path.join(
   process.cwd(),
   'node_modules',
-  '.bin',
-  process.platform === 'win32' ? 'vsce.cmd' : 'vsce',
+  '@vscode',
+  'vsce',
+  'vsce',
 )
-const result = spawnSync(executable, ['package', '--target', target, '--allow-missing-repository'], {
+// Spawn the vsce JS entry through the current Node executable instead of the
+// platform shim (node_modules/.bin/vsce.cmd): spawning a .cmd directly from
+// Node on Windows fails with EINVAL, which made `npm run package` unusable on
+// Windows. Using process.execPath is cross-platform and avoids the shim layer.
+const result = spawnSync(process.execPath, [executable, 'package', '--target', target, '--allow-missing-repository'], {
   stdio: 'inherit',
 })
 if (result.error !== undefined) throw result.error
