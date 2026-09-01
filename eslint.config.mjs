@@ -17,6 +17,11 @@ export default tseslint.config(
       '@typescript-eslint/consistent-type-imports': 'error',
       '@typescript-eslint/no-explicit-any': 'error',
       'no-console': 'error',
+      // Soft size guardrails (warn only): files and functions are split by
+      // responsibility first — a large cohesive module is acceptable — but a
+      // warning flags modules worth a second look.
+      'max-lines': ['warn', 800],
+      'max-lines-per-function': ['warn', 200],
     },
   },
 )
