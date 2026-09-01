@@ -37,6 +37,7 @@ import { closePermissionConfirm, closePermissionPopup, renderSessions, toggleArc
 import { isAtBottom, isNearBottom } from './utils.js'
 import { FULL_ACCESS_PERMISSION_ID } from '../../domain/permissions.js'
 import { closeTimeline, openTimeline } from './timeline.js'
+import { clipboardImageFiles } from './clipboard-images.js'
 
 // Streaming auto-follow yields to any reach for the scrollbar. A mouse-down
 // arms the interaction (drag intent before the first scroll event), wheel-up
@@ -234,16 +235,7 @@ document.addEventListener('paste', (event) => {
   if (!(target instanceof Node) || !elements.prompt.parentElement?.contains(target)) return
   const clipboardData = event.clipboardData
   if (!clipboardData) return
-  const itemFiles = clipboardData.items === undefined
-    ? []
-    : Array.from(clipboardData.items)
-      .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
-      .map((item) => item.getAsFile())
-      .filter((file) => file !== undefined && file !== null)
-  const directFiles = clipboardData.files === undefined
-    ? []
-    : Array.from(clipboardData.files).filter((file) => file.type.startsWith('image/'))
-  const files = [...new Map([...itemFiles, ...directFiles].map((file) => [`${file.name}:${file.size}:${file.lastModified}`, file])).values()]
+  const files = clipboardImageFiles(clipboardData)
   if (files.length === 0) return
   event.preventDefault()
   void addPastedImages(files)
