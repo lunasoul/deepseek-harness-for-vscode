@@ -31,7 +31,7 @@ export interface WorktreePreparation {
   readonly isolated: boolean
   readonly record?: WorktreeRecord
   /** Human-readable reason when isolation could not be established. */
-  readonly reason?: string
+  readonly reason?: 'git-not-found' | 'no-git-repo' | 'detached-head' | 'worktree-add-failed'
 }
 
 export interface MergeOutcome {
@@ -97,8 +97,10 @@ export class WorktreeService implements vscode.Disposable {
    * worktree creation failure) with a reason.
    */
   async prepare(sessionId: string, baseCwd: string): Promise<WorktreePreparation> {
-    const repoRoot = await gitRoot(this.run, baseCwd)
-    if (repoRoot === undefined) return { cwd: baseCwd, isolated: false, reason: 'no-git-repo' }
+    const probe = await gitRoot(this.run, baseCwd)
+    if (probe.gitNotFound) return { cwd: baseCwd, isolated: false, reason: 'git-not-found' }
+    if (probe.root === undefined) return { cwd: baseCwd, isolated: false, reason: 'no-git-repo' }
+    const repoRoot = probe.root
     const baseBranch = await currentBranch(this.run, repoRoot)
     if (baseBranch === undefined) return { cwd: baseCwd, isolated: false, reason: 'detached-head' }
     const branch = `dsh/${sessionId}`
@@ -424,14 +426,25 @@ export class WorktreeService implements vscode.Disposable {
   }
 }
 
-async function gitRoot(run: GitRunner, cwd: string): Promise<string | undefined> {
+/**
+ * Probes the git binary and the workspace's repository status in one call.
+ * A missing `git` executable (`ENOENT` from the child process) is reported
+ * separately from a non-git directory so the caller can tell the user apart:
+ * "install Git / add it to PATH" vs "this folder is not a repository".
+ */
+async function gitRoot(run: GitRunner, cwd: string): Promise<{ root: string | undefined; gitNotFound: boolean }> {
   try {
     const { stdout } = await run(cwd, ['rev-parse', '--show-toplevel'])
     const root = stdout.trim()
-    return root === '' ? undefined : root
-  } catch {
-    return undefined
+    return { root: root === '' ? undefined : root, gitNotFound: false }
+  } catch (error) {
+    return { root: undefined, gitNotFound: isGitNotFound(error) }
   }
+}
+
+/** Whether a git invocation failed because the executable itself is absent. */
+function isGitNotFound(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT'
 }
 
 async function currentBranch(run: GitRunner, repoRoot: string): Promise<string | undefined> {

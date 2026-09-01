@@ -5,7 +5,7 @@ import { createEditorContextComponent } from '../editor-context/component.js'
 import { createFileMentionComponent } from '../file-mention/component.js'
 import { renderMarkdown } from '../markdown.js'
 import { createPluginCenterComponent } from '../plugin-center/component.js'
-import { createSessionChangesComponent } from '../session-changes/component.js'
+import { shouldPinStreamFrame } from '../streaming-message/scroll-policy.js'
 import { StreamingMessageComponent } from '../streaming-message/component.js'
 import { createWorkDurationComponent } from '../work-duration/component.js'
 import { formatWorkDuration } from '../work-duration/format.js'
@@ -14,7 +14,7 @@ import { closeCommandMenu } from './command-menu.js'
 import { components, elements, followStream, interactionArmed, payload, post, t } from './context.js'
 import { markdownActions } from './markdown-actions.js'
 import { toggleHistory } from './sessions.js'
-import { formatTokenCount, isNearBottom, pinConversationToBottom } from './utils.js'
+import { formatTokenCount, pinConversationToBottom } from './utils.js'
 
 const connectionTranslate = (key: string, values?: Record<string, string | number>): string =>
   t(key as Parameters<typeof t>[0], values)
@@ -63,14 +63,6 @@ components.fileMention = createFileMentionComponent({
 
 components.workDuration = createWorkDurationComponent({ document, translate: t })
 
-components.sessionChanges = createSessionChangesComponent({
-  document,
-  translate: t,
-  onOpenFile: (path) => post('openFile', { path }),
-  onReview: () => post('sessionChangesReview'),
-  onUndo: () => post('sessionChangesUndo'),
-})
-
 components.streamingMessage = new StreamingMessageComponent({
   document,
   reasoningLabel: () => t('reasoningProcess'),
@@ -83,8 +75,10 @@ components.streamingMessage = new StreamingMessageComponent({
   renderMarkdown: (target, source) => renderMarkdown(target, source, markdownActions),
   onStreamFrame: () => {
     // A pending pointer interaction (scrollbar grab, text selection) pauses
-    // the pin so the reader's cursor never fights the auto-scroll.
-    if (followStream && !interactionArmed && isNearBottom(elements.chat)) {
+    // the pin so the reader's cursor never fights the auto-scroll. Follow
+    // intent is `followStream` alone — no proximity probe, which would
+    // self-lock (see shouldPinStreamFrame).
+    if (shouldPinStreamFrame(followStream, interactionArmed)) {
       pinConversationToBottom()
     }
   },

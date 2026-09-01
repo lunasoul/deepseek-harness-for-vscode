@@ -27,6 +27,13 @@ export interface SessionListItem {
   readonly meta?: SessionMeta
   /** Whether this session runs in its own git worktree (plan A2 isolation). */
   readonly isolated?: boolean
+  /**
+   * Whether this session runs directly in the shared workspace folder with no
+   * git worktree isolation (git missing, non-git workspace, detached HEAD, or
+   * a worktree that failed to be created). Other shared sessions see and can
+   * edit the same code; only isolated sessions are fenced apart.
+   */
+  readonly shared?: boolean
 }
 
 export interface ChatBlock {
@@ -120,8 +127,47 @@ export interface ActiveSessionView {
   readonly tokenUsage?: TokenUsageView
   readonly contextPressure?: ContextPressureView
   readonly changes?: SessionChangesView
+  /** Per-turn edited-file cards kept with the transcript (see TurnChangesView). */
+  readonly turnChanges?: readonly TurnChangesView[]
   readonly stats?: SessionStatsView
   readonly effortIntent?: EffortIntent
+  /** Live model-request retry (dsh-llm-retry); visible while the turn is in flight. */
+  readonly retry?: ModelRetryView
+}
+
+/**
+ * One provider-routed model-request retry, projected from the `llm/retry` /
+ * `llm/retry-started` events emitted by `dsh-llm-retry`. A retry is shown
+ * while the turn is still running and is cleared the moment the model resumes
+ * producing (assistant chunk/message or tool call) or the turn ends.
+ */
+export interface ModelRetryView {
+  readonly provider: string
+  readonly mode: 'normal' | 'always'
+  /** 1-based retry attempt number for this step's retry chain. */
+  readonly attempt: number
+  /** Finite budget in normal mode; absent in always mode (unbounded). */
+  readonly maxRetries?: number
+  /** Normalized failure code (TIMEOUT / TRANSPORT / SERVER / RATE_LIMIT / ...). */
+  readonly code?: string
+  readonly message?: string
+  /** Scheduled wait before this attempt, when known. */
+  readonly delayMs?: number
+  /** Whether the wait has finished and the retried request is in flight. */
+  readonly started: boolean
+}
+
+/**
+ * One finished turn's edited-file card, kept as part of the transcript: it
+ * rides below the turn's conclusion and survives session/history switches.
+ * `conclusionId` is the event id (`event-<seq>`) of the turn's last assistant
+ * message, used to slot the card directly under that conclusion.
+ */
+export interface TurnChangesView {
+  readonly seq: number
+  readonly turn: number
+  readonly conclusionId: string
+  readonly changes: SessionChangesView
 }
 
 /**
@@ -236,6 +282,37 @@ export interface TokenUsageView {
   readonly cacheWriteTokens: number
 }
 
+/** Lifts a raw `llm/retry` (or `llm/retry-started`) payload into a view. */
+function projectRetryView(value: unknown, fromStarted: boolean): ModelRetryView {
+  if (!isRecord(value)) {
+    return fromStarted
+      ? { provider: '', mode: 'normal', attempt: 1, started: true }
+      : { provider: '', mode: 'normal', attempt: 1, started: false }
+  }
+  const provider = typeof value.provider === 'string' ? value.provider : ''
+  const mode = value.mode === 'always' ? 'always' : 'normal'
+  const attempt = typeof value.retry === 'number' && Number.isSafeInteger(value.retry) && value.retry > 0 ? value.retry : 1
+  const maxRetries = mode === 'normal' && typeof value.maxRetries === 'number' && Number.isSafeInteger(value.maxRetries)
+    ? value.maxRetries
+    : undefined
+  const delayMs = typeof value.delayMs === 'number' && Number.isFinite(value.delayMs) && value.delayMs > 0
+    ? value.delayMs
+    : undefined
+  const failure = isRecord(value.failure) ? value.failure : undefined
+  const code = typeof failure?.code === 'string' && failure.code.trim() !== '' ? failure.code : undefined
+  const message = typeof failure?.message === 'string' && failure.message.trim() !== '' ? failure.message : undefined
+  return {
+    provider,
+    mode,
+    attempt,
+    ...(maxRetries === undefined ? {} : { maxRetries }),
+    ...(code === undefined ? {} : { code }),
+    ...(message === undefined ? {} : { message }),
+    ...(delayMs === undefined ? {} : { delayMs }),
+    started: fromStarted,
+  }
+}
+
 /** Projects the harness `tokenUsage` session projection (0 when absent). */
 export function projectionTokenUsage(value: unknown): TokenUsageView | undefined {
   if (!isRecord(value)) return undefined
@@ -336,6 +413,7 @@ export function projectionGoal(value: unknown): GoalView | undefined {
 export function projectConversation(entries: readonly HistoryEntry[], labels = ENGLISH_WORKBENCH_LABELS): {
   readonly messages: ChatItem[]
   readonly todos: { readonly content: string; readonly status: string }[]
+  readonly retry?: ModelRetryView
 } {
   const messages: ChatItem[] = []
   const messageTurns = new Map<string, number>()
@@ -397,6 +475,24 @@ export function projectConversation(entries: readonly HistoryEntry[], labels = E
         ...(event.data.text === undefined ? {} : { text: event.data.text }),
       })
     }
+  }
+
+  // Project the newest live model-request retry chain. It is cleared as soon
+  // as the model resumes producing (assistant chunk / message, tool call) or
+  // the turn settles, so the reader only sees it while recovery is actually
+  // in flight — the final failure itself surfaces as the turn/end notice.
+  let retry: ModelRetryView | undefined
+  const hasResumption = (event: { readonly type: string }): boolean =>
+    event.type === 'assistant/chunk' || event.type === 'assistant/message'
+    || event.type === 'tool/call' || event.type === 'turn/end'
+  for (const { event } of entries) {
+    const type = (event as { readonly type: string }).type
+    if (type !== 'llm/retry' && type !== 'llm/retry-started') {
+      if (hasResumption(event as { readonly type: string })) retry = undefined
+      continue
+    }
+    if (type === 'llm/retry') retry = projectRetryView((event as { readonly data: unknown }).data, false)
+    else retry = { ...(retry ?? projectRetryView((event as { readonly data: unknown }).data, true)), started: true }
   }
 
   for (const { event } of entries) {
@@ -534,7 +630,7 @@ export function projectConversation(entries: readonly HistoryEntry[], labels = E
   }
   messages.sort((left, right) => left.seq - right.seq)
   attachTurnDurations(messages, messageTurns, projectTurnDurations(entries))
-  return { messages, todos }
+  return { messages, todos, ...(retry === undefined ? {} : { retry }) }
 }
 
 /** Attaches one cumulative footer per turn to its last visible item. */

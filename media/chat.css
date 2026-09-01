@@ -1581,6 +1581,13 @@ body.vscode-light .markdown-body .hljs-deletion { background: color-mix(in srgb,
   color: var(--vscode-foreground);
   animation: activity-verb-pulse 1.6s ease-in-out infinite;
 }
+.activity-retry {
+  color: var(--vscode-editorWarning-foreground, var(--vscode-descriptionForeground));
+  font-size: 11px;
+  opacity: 0.85;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
 .activity-hint {
   opacity: 0.65;
 }
@@ -2429,7 +2436,7 @@ body.vscode-light .markdown-body .hljs-deletion { background: color-mix(in srgb,
    surface instead of a full-bleed strip, and the file list follows the
    transcript semantics ("+170 −2" per row). */
 .changes-bar {
-  margin: 2px 4px 8px;
+  margin: 0 2px 4px;
   padding: 9px 11px;
   display: flex;
   flex-direction: column;
@@ -3845,6 +3852,16 @@ body.vscode-light .effort-control[data-effort="max"] {
   justify-content: space-between;
   gap: 6px;
 }
+/* One flat parent row: the three wrappers stop generating boxes, so every
+   composer control (context / permission / meter / model / send) is a direct
+   flex child of .composer-bar and shares one gap and one shrink policy.
+   Without this, shrinking was split across three nested containers and the
+   model toggle could squeeze the permission pill off the row. */
+.composer-tools,
+.composer-meta,
+.composer-actions {
+  display: contents;
+}
 .composer-tools {
   flex: 0 1 auto;
   min-width: 0;
@@ -3903,6 +3920,8 @@ body.vscode-light .effort-control[data-effort="max"] {
   border-radius: 999px;
   font-size: 11px;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   flex-shrink: 0;
   transition:
     background-color 160ms ease,
@@ -4159,8 +4178,10 @@ body.vscode-light .effort-control[data-effort="max"] {
 .configuration-toggle {
   width: auto;
   min-width: 0;
+  max-width: min(240px, 60vw);
   height: 30px;
   padding: 0 9px;
+  flex: 0 1 auto;
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -4769,4 +4790,8 @@ body.vscode-light .effort-control[data-effort="max"] {
   background: var(--vscode-badge-background);
   color: var(--vscode-badge-foreground);
   white-space: nowrap;
+}
+.session-tag.shared {
+  background: color-mix(in srgb, var(--vscode-badge-background) 55%, transparent);
+  color: var(--vscode-descriptionForeground);
 }

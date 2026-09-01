@@ -45,7 +45,6 @@ export function render(): void {
   renderComposer(active)
   renderActivityStatus(active)
   renderQueued(active)
-  components.sessionChanges.update(active?.changes)
   updateCommandMenu()
   components.connectionSettings.update(
     payload.connectionSettings ?? { writable: false, providers: [] },
@@ -127,7 +126,15 @@ export function sendPrompt(): void {
   elements.prompt.value = ''
   clearPastedImages()
   resizePrompt()
-  if (optimisticBubbles.length > 0) renderMessages(payload?.state.active)
+  if (optimisticBubbles.length > 0) {
+    renderMessages(payload?.state.active)
+    // Sending is an explicit intent to see the newest content: pin to the
+    // bottom no matter how far the pre-render position was from it. The
+    // wasNearBottom gate in renderMessages would otherwise strand the user's
+    // own bubble below the fold when they sent from a spot >100px above the
+    // very bottom (e.g. while re-reading an earlier message).
+    scrollConversationToBottom()
+  }
 }
 
 /** Backstop rejection when an image prompt cannot be served by the model. */

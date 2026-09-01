@@ -36,6 +36,41 @@ export function renderActivityStatus(active: ActiveSessionView | undefined): voi
   // /compact surface as a notice item that stays `running` until command/done.
   const commandRunning = (active?.messages ?? []).some((item) => item.kind === 'notice' && item.status === 'running')
   elements.activityStatus.classList.toggle('hidden', active?.running !== true && !commandRunning)
+  const retry = active?.retry
+  if (retry === undefined) {
+    elements.activityRetry.classList.add('hidden')
+    elements.activityRetry.textContent = ''
+    return
+  }
+  elements.activityRetry.classList.remove('hidden')
+  elements.activityRetry.textContent = retryStatusText(retry)
+}
+
+/** One-line live model-request retry label, e.g. "model request timed out · retrying (2/5)…". */
+function retryStatusText(retry: NonNullable<ActiveSessionView['retry']>): string {
+  const reason = retryReasonLabel(retry.code)
+  const attempt = retry.mode === 'always'
+    ? t('retryingAlways', { reason })
+    : t('retryingWithAttempt', { reason, attempt: retry.attempt, max: retry.maxRetries ?? retry.attempt })
+  if (retry.started) return attempt
+  const seconds = retryDelaySeconds(retry.delayMs)
+  return seconds > 0 ? `${attempt} · ${t('retryInSeconds', { seconds })}` : attempt
+}
+
+function retryReasonLabel(code: string | undefined): string {
+  switch (code) {
+    case 'TIMEOUT': return t('retryReasonTimeout')
+    case 'TRANSPORT': return t('retryReasonTransport')
+    case 'SERVER': return t('retryReasonServer')
+    case 'RATE_LIMIT': return t('retryReasonRateLimit')
+    case 'EMPTY_RESPONSE': return t('retryReasonEmptyResponse')
+    default: return t('retryReasonGeneric')
+  }
+}
+
+function retryDelaySeconds(delayMs: number | undefined): number {
+  if (delayMs === undefined) return 0
+  return Math.max(1, Math.round(delayMs / 1000))
 }
 
 /** QueueDock: prompts the user queued while a turn was running. */

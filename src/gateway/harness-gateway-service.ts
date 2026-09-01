@@ -27,7 +27,7 @@ import { isProviderRouteInUse } from '../domain/provider.js'
 import type { PromptAttachment } from '../domain/prompt-context.js'
 import { agentPresetTransition, type PromptConfiguration } from '../domain/prompt-configuration.js'
 import { conversationTitle } from '../domain/session-title.js'
-import { projectSessionChanges } from '../domain/session-changes.js'
+import { projectSessionChanges, type SessionChangesView } from '../domain/session-changes.js'
 import { isAutoEffort, resolveEffortIntent, type AutoEffortSignals, type EffortIntent, type PromptEffortSignals } from '../domain/session-effort.js'
 import { pickAutoModel, type ModelProfileInput } from '../domain/model-profile.js'
 import {
@@ -62,6 +62,7 @@ import {
   type PendingQuestionView,
   type QueuedPromptView,
   type SubagentView,
+  type TurnChangesView,
   type WorkbenchLabels,
 } from '../domain/workbench-state.js'
 import type { HarnessHostRuntime } from '../runtime/web-runtime.js'
@@ -154,6 +155,8 @@ export class HarnessGatewayService implements vscode.Disposable {
    * same worktree (index.lock races); entries are removed when the merge settles.
    */
   private readonly autoMergingSessions = new Set<string>()
+  /** Per-session finished-turn edited-file cards, kept with the transcript. */
+  private readonly turnChangesBySession = new Map<string, TurnChangesEntry[]>()
 
   readonly onDidChange = this.changeEmitter.event
 
@@ -168,6 +171,7 @@ export class HarnessGatewayService implements vscode.Disposable {
     this.restoredIds = new Set(readRestoredArchiveIds(globalState.get(RESTORED_ARCHIVE_STATE_KEY)))
     loadEffortIntents(globalState.get(EFFORT_INTENT_STATE_KEY), this.effortIntents)
     loadSessionMeta(globalState.get(SESSION_META_STATE_KEY), this.metaBySession)
+    loadTurnChanges(globalState.get(TURN_CHANGES_STATE_KEY), this.turnChangesBySession)
     this.runtimeSubscription = runtime.onDidChangeState((state) => {
       if (state.phase === 'error') {
         this.phase = 'error'
@@ -262,6 +266,15 @@ export class HarnessGatewayService implements vscode.Disposable {
           // The user can still create a new session and inspect the log.
           this.output.appendLine(vscode.l10n.t('[gateway] Failed to load recent sessions: {0}', errorMessage(cause)))
         }
+      } else {
+        // No session to resume: open a fresh blank one so the model and
+        // permission selectors are usable before the first message is sent.
+        // Blank sessions are archivable and never pollute the history.
+        try {
+          await this.createSession()
+        } catch (cause) {
+          this.output.appendLine(vscode.l10n.t('[gateway] Failed to open a fresh session: {0}', errorMessage(cause)))
+        }
       }
     } catch (cause) {
       // A failed baseline must still tear down the half-started runtime so a
@@ -311,6 +324,7 @@ export class HarnessGatewayService implements vscode.Disposable {
     const tokenUsage = projectionTokenUsage(this.projections.tokenUsage)
     const contextPressure = projectionContextPressure(this.projections.contextPressure)
     const changes = projectSessionChanges(this.entries)
+    const turnChanges = activeSummary === undefined ? undefined : this.turnChangesFor(String(activeSummary.sessionId))
     const stats = projectionSessionStats(this.projections.sessionStats) ?? projectSessionStats(this.entries)
     const effortIntent = activeSummary === undefined ? undefined : this.effortIntents.get(String(activeSummary.sessionId))
     const active = activeSummary === undefined ? undefined : {
@@ -331,6 +345,7 @@ export class HarnessGatewayService implements vscode.Disposable {
       }))) ?? [],
       messages: projected.messages,
       todos: projected.todos,
+      ...(projected.retry === undefined ? {} : { retry: projected.retry }),
       skills: this.skills,
       jobs: this.jobs,
       queue: this.queue.map(queuedPromptView),
@@ -349,6 +364,7 @@ export class HarnessGatewayService implements vscode.Disposable {
       ...(tokenUsage === undefined ? {} : { tokenUsage }),
       ...(contextPressure === undefined ? {} : { contextPressure }),
       ...(changes === undefined ? {} : { changes }),
+      ...(turnChanges === undefined || turnChanges.length === 0 ? {} : { turnChanges }),
       ...(stats.turns > 0 ? { stats } : {}),
       ...(effortIntent === undefined ? {} : { effortIntent }),
     }
@@ -402,12 +418,20 @@ export class HarnessGatewayService implements vscode.Disposable {
       throw cause
     }
     if (!prepared.isolated && prepared.reason !== undefined) {
-      const note = prepared.reason === 'no-git-repo'
-        ? vscode.l10n.t('The workspace is not a git repository, so this session shares the workspace folder instead of an isolated worktree.')
-        : prepared.reason === 'detached-head'
-          ? vscode.l10n.t('The repository has no active branch (detached HEAD), so this session shares the workspace folder instead of an isolated worktree.')
-          : vscode.l10n.t('Could not create an isolated worktree for this session, so it shares the workspace folder.')
-      void vscode.window.showInformationMessage(note)
+      const note = prepared.reason === 'git-not-found'
+        ? vscode.l10n.t('Git was not found on this machine, so this session shares the workspace folder instead of an isolated worktree. Review, Merge and Discard stay unavailable until Git is on PATH.')
+        : prepared.reason === 'no-git-repo'
+          ? vscode.l10n.t('The workspace is not a git repository, so this session shares the workspace folder instead of an isolated worktree.')
+          : prepared.reason === 'detached-head'
+            ? vscode.l10n.t('The repository has no active branch (detached HEAD), so this session shares the workspace folder instead of an isolated worktree.')
+            : vscode.l10n.t('Could not create an isolated worktree for this session, so it shares the workspace folder.')
+      if (prepared.reason === 'git-not-found') {
+        void vscode.window.showInformationMessage(note, vscode.l10n.t('Install Git')).then((selection) => {
+          if (selection !== undefined) void vscode.env.openExternal(vscode.Uri.parse('https://git-scm.com/downloads'))
+        })
+      } else {
+        void vscode.window.showInformationMessage(note)
+      }
     }
     if (agentPreset !== undefined) await this.configuration.setAgentPresetIfKnown(agentPreset)
     await this.refreshSessionList()
@@ -1332,6 +1356,48 @@ export class HarnessGatewayService implements vscode.Disposable {
       })
   }
 
+  /**
+   * Snapshots one finished turn's edited-file card so it stays with the
+   * transcript (below that turn's conclusion) instead of being replaced by
+   * the newest turn. Only the active session's entries are known here — the
+   * in-memory transcript belongs to the active conversation — so background
+   * sessions' turn cards are recorded when their turn ends while selected.
+   */
+  private recordTurnChanges(sessionId: string, event: HistoryEntry['event']): void {
+    if (sessionId !== this.activeSessionId || event.type !== 'turn/end') return
+    const turn = typeof event.data?.turn === 'number' ? event.data.turn : undefined
+    if (turn === undefined) return
+    const changes = projectSessionChanges(this.entries)
+    if (changes === undefined || changes.files.length === 0) return
+    const conclusionSeq = lastAssistantSeq(this.entries)
+    if (conclusionSeq === undefined) return
+    const existing = this.turnChangesBySession.get(sessionId) ?? []
+    const next = existing.filter((entry) => entry.turn !== turn)
+    next.push({ seq: event.seq, turn, conclusionSeq, changes })
+    next.sort((left, right) => left.turn - right.turn)
+    this.turnChangesBySession.set(sessionId, next)
+    for (const key of Array.from(this.turnChangesBySession.keys())) {
+      if (key !== sessionId && this.summaries.get(key) === undefined) this.turnChangesBySession.delete(key)
+    }
+    void this.persistTurnChanges()
+    this.fireChange()
+  }
+
+  /** The recorded turn cards for one session, in transcript order. */
+  private turnChangesFor(sessionId: string): TurnChangesView[] {
+    return (this.turnChangesBySession.get(sessionId) ?? []).map((entry) => ({
+      seq: entry.seq,
+      turn: entry.turn,
+      conclusionId: `event-${entry.conclusionSeq}`,
+      changes: entry.changes,
+    }))
+  }
+
+  /** Mirror of the turn-changes registry; writes are best-effort. */
+  private persistTurnChanges(): void {
+    void this.globalState.update(TURN_CHANGES_STATE_KEY, Object.fromEntries(this.turnChangesBySession))
+  }
+
   /** Removes an isolated session's worktree and branch; the session log stays. */
   async worktreeDiscard(sessionId: string): Promise<{ ok: boolean; message: string }> {
     const outcome = await this.worktrees.discard(sessionId)
@@ -1473,6 +1539,7 @@ export class HarnessGatewayService implements vscode.Disposable {
         this.admittedSessions.delete(id)
         this.flushPendingConfiguration(id)
         this.maybeAutoMergeWorktree(id)
+        this.recordTurnChanges(id, frame.event)
       }
     } else if (frame.type === 'approval/requested' && String(frame.sessionId) === this.activeSessionId) {
       const key = `approval:${String(rpcId)}`
@@ -1729,8 +1796,12 @@ export class HarnessGatewayService implements vscode.Disposable {
 
   private sessionListItemWithIsolation(summary: SessionSummary): ReturnType<typeof sessionListItem> {
     const item = sessionListItem(summary, this.labels)
-    if (this.worktrees.recordFor(String(summary.sessionId)) === undefined) return item
-    return { ...item, isolated: true }
+    if (this.worktrees.recordFor(String(summary.sessionId)) !== undefined) return { ...item, isolated: true }
+    // No worktree: the session runs directly in the shared workspace folder
+    // (git missing, non-git workspace, detached HEAD, or worktree-add failure).
+    // Mark it so the user can tell fenced sessions from ones that share the
+    // same code with every other non-isolated session.
+    return { ...item, shared: true }
   }
 
   private async refreshPresets(): Promise<void> {
@@ -2018,6 +2089,7 @@ function subagentView(entry: SubagentListEntry): SubagentView {
 
 const EFFORT_INTENT_STATE_KEY = 'deepseekHarness.sessionEffortIntents'
 const SESSION_META_STATE_KEY = 'deepseekHarness.sessionMeta'
+const TURN_CHANGES_STATE_KEY = 'deepseekHarness.sessionTurnChanges'
 /** How long the startup baseline may take before the watchdog fails the boot. */
 const START_BASELINE_TIMEOUT_S = 45
 const DEFAULT_REASONING_OPTIONS: readonly { readonly id: string }[] = [
@@ -2059,5 +2131,38 @@ function localizedWorkbenchLabels(): WorkbenchLabels {
     outputLimitReached: vscode.l10n.t('Output limit reached'),
     taskBlocked: vscode.l10n.t('Task blocked'),
     turnFailed: vscode.l10n.t('Turn failed'),
+  }
+}
+
+/** One recorded per-turn edited-file card for a session. */
+interface TurnChangesEntry {
+  readonly seq: number
+  readonly turn: number
+  readonly conclusionSeq: number
+  readonly changes: SessionChangesView
+}
+
+/** The event seq of the last assistant message in the transcript, if any. */
+function lastAssistantSeq(entries: readonly HistoryEntry[]): number | undefined {
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const event = entries[index]?.event
+    if (event?.type === 'assistant/message') {
+      return typeof event.seq === 'number' ? event.seq : undefined
+    }
+  }
+  return undefined
+}
+
+function loadTurnChanges(raw: unknown, target: Map<string, TurnChangesEntry[]>): void {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return
+  for (const [sessionId, value] of Object.entries(raw)) {
+    if (!Array.isArray(value)) continue
+    const entries = value.filter((entry): entry is TurnChangesEntry =>
+      typeof entry === 'object' && entry !== null
+      && typeof (entry as { seq?: unknown }).seq === 'number'
+      && typeof (entry as { turn?: unknown }).turn === 'number'
+      && typeof (entry as { conclusionSeq?: unknown }).conclusionSeq === 'number'
+      && typeof (entry as { changes?: unknown }).changes === 'object')
+    if (entries.length > 0) target.set(sessionId, entries)
   }
 }

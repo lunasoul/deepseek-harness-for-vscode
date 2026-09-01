@@ -42,6 +42,12 @@ export function renderSessions(): void {
     const meta = node('span', 'session-meta', formatRelativeTime(session.updatedAt))
     if (session.agentPreset) meta.append(` · ${session.agentPreset}`)
     button.append(top, meta)
+    if (session.shared === true) {
+      const shared = node('span', 'session-tag shared', t('sharedWorkspaceTag'))
+      shared.title = t('sharedWorkspaceHint')
+      shared.setAttribute('aria-label', t('sharedWorkspaceHint'))
+      button.append(shared)
+    }
     const tags = session.meta?.tags ?? []
     if (tags.length > 0) {
       const tagRow = node('span', 'session-tags')

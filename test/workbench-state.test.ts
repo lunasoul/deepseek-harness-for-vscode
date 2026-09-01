@@ -285,6 +285,78 @@ describe('projectionCommands', () => {
   })
 })
 
+describe('projectConversation retry projection', () => {
+  it('projects a scheduled normal-mode retry and clears it when the model resumes', () => {
+    const streaming = [
+      entry(0, 'assistant/chunk', { turn: 1, step: 1, chunk: { type: 'block-start', index: 0, blockType: 'text' } }),
+      entry(1, 'llm/retry', {
+        retryId: 'r1', turn: 1, step: 1, provider: 'deepseek-official', mode: 'normal',
+        policyKey: '["normal",5,...]', retry: 1, maxRetries: 5, delayMs: 2500,
+        failure: { code: 'TIMEOUT', message: 'request timed out' },
+      }),
+      entry(2, 'llm/retry-started', { retryId: 'r1', turn: 1, step: 1, retry: 1 }),
+      entry(3, 'assistant/chunk', { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: '恢复了' } }),
+    ] as HistoryEntry[]
+
+    expect(projectConversation(streaming).retry).toBeUndefined()
+
+    const retrying = streaming.slice(0, 3)
+    expect(projectConversation(retrying).retry).toEqual({
+      provider: 'deepseek-official',
+      mode: 'normal',
+      attempt: 1,
+      maxRetries: 5,
+      code: 'TIMEOUT',
+      message: 'request timed out',
+      delayMs: 2500,
+      started: true,
+    })
+  })
+
+  it('carries the attempt counter up while the retry chain keeps failing', () => {
+    const entries = [
+      entry(0, 'llm/retry', {
+        retryId: 'r1', turn: 1, step: 1, provider: 'p', mode: 'normal',
+        policyKey: 'k', retry: 1, maxRetries: 5, delayMs: 1000,
+        failure: { code: 'TRANSPORT', message: 'connect failed' },
+      }),
+      entry(1, 'llm/retry', {
+        retryId: 'r1', turn: 1, step: 1, provider: 'p', mode: 'normal',
+        policyKey: 'k', retry: 2, maxRetries: 5, delayMs: 2000,
+        failure: { code: 'TRANSPORT', message: 'connect failed' },
+      }),
+    ] as HistoryEntry[]
+
+    expect(projectConversation(entries).retry).toMatchObject({ attempt: 2, maxRetries: 5, started: false })
+  })
+
+  it('projects always mode without a finite budget and clears on turn/end', () => {
+    const retrying = [
+      entry(0, 'llm/retry', {
+        retryId: 'r2', turn: 2, step: 1, provider: 'relay', mode: 'always',
+        policyKey: 'k', retry: 4, delayMs: 1000, failure: { code: 'SERVER', message: 'boom' },
+      }),
+    ] as HistoryEntry[]
+    expect(projectConversation(retrying).retry).toEqual({
+      provider: 'relay', mode: 'always', attempt: 4, code: 'SERVER', message: 'boom', delayMs: 1000, started: false,
+    })
+
+    const ended = [
+      ...retrying,
+      entry(1, 'turn/end', { turn: 2, reason: { kind: 'completed' } }),
+    ] as HistoryEntry[]
+    expect(projectConversation(ended).retry).toBeUndefined()
+  })
+
+  it('ignores malformed retry payloads instead of crashing', () => {
+    const entries = [
+      entry(0, 'llm/retry', { retryId: 'x', turn: 1, step: 1, retry: 0 }),
+      entry(1, 'llm/retry-started', undefined),
+    ] as HistoryEntry[]
+    expect(projectConversation(entries).retry).toEqual({ provider: '', mode: 'normal', attempt: 1, started: true })
+  })
+})
+
 describe('projectionPermissions', () => {
   it('preserves the Harness value/name transport shape for the Webview adapter', () => {
     expect(projectionPermissions({

@@ -101,6 +101,7 @@ export interface ChatElements {
   readonly send: HTMLButtonElement
   readonly composerStatus: HTMLElement
   readonly activityStatus: HTMLElement
+  readonly activityRetry: HTMLElement
   readonly composerHint: HTMLElement
   readonly queuedPanel: HTMLElement
 }

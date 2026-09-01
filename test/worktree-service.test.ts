@@ -59,6 +59,20 @@ describe('WorktreeService.prepare', () => {
     expect(prepared.reason).toBe('no-git-repo')
   })
 
+  it('reports a missing git executable separately so the user is told to install it', async () => {
+    const { memento } = memStore()
+    const missing = Object.assign(new Error('spawn git ENOENT'), { code: 'ENOENT' })
+    const run: GitRunner = () => Promise.reject(missing)
+    const service = new WorktreeService(memento, run)
+
+    const prepared = await service.prepare('abc123', '/plain')
+
+    expect(prepared.isolated).toBe(false)
+    expect(prepared.cwd).toBe('/plain')
+    expect(prepared.reason).toBe('git-not-found')
+    expect(prepared.record).toBeUndefined()
+  })
+
   it('falls back when the worktree add fails', async () => {
     const { memento } = memStore()
     const run: GitRunner = (_cwd, args) => {

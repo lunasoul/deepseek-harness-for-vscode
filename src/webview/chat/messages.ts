@@ -1,6 +1,7 @@
 import type { ActiveSessionView, ChatItem } from '../../domain/workbench-state.js'
 import { splitCarriedBlocks } from '../../domain/carry-over.js'
 import { renderMarkdown, resetReferenceValidation } from '../markdown.js'
+import { createSessionChangesCard } from '../session-changes/component.js'
 import {
   components,
   elements,
@@ -10,6 +11,7 @@ import {
   node,
   optimisticBubbles,
   payload,
+  post,
   renderedSessionId,
   setOptimisticBubbles,
   setRenderedSessionId,
@@ -24,6 +26,7 @@ import type { OptimisticBubble } from './types.js'
 import {
   captureDisclosures,
   copyText,
+  cssEscape,
   estimateReasoningTokens,
   formatTokenCount,
   isNearBottom,
@@ -60,6 +63,7 @@ export function renderMessages(active: ActiveSessionView | undefined): void {
     // A new transcript means a new existence ledger: verified references from
     // the previous session must be re-checked before becoming clickable again.
     resetReferenceValidation()
+    clearTurnChangesCards()
   }
   if (sessionChanged && optimisticBubbles.length > 0) setOptimisticBubbles([])
   reconcileOptimistic(realMessages)
@@ -82,7 +86,9 @@ export function renderMessages(active: ActiveSessionView | undefined): void {
   // The step timeline spine only exists while a conversation is in flight;
   // once the turn ends the rail disappears from the finished transcript.
   elements.messages.classList.toggle('timeline-live', running)
-  const existing = new Map(Array.from(elements.messages.children).map((child) => [(child as HTMLElement).dataset.messageId ?? '', child as HTMLElement]))
+  const existing = new Map(Array.from(elements.messages.children)
+    .filter((child) => !(child.classList.contains('turn-changes-card')))
+    .map((child) => [(child as HTMLElement).dataset.messageId ?? '', child as HTMLElement]))
   const retained = new Set<string>()
   let cursor = elements.messages.firstElementChild
 
@@ -133,6 +139,10 @@ export function renderMessages(active: ActiveSessionView | undefined): void {
   // checklist diverged from the current session state.
   refreshTodoCards(active?.todos ?? [])
   elements.empty.classList.toggle('hidden', messages.length > 0)
+  // Per-turn edited-file cards sit below their conclusion; reconcile them
+  // BEFORE the scroll logic so the bottom-pin measurement includes card
+  // heights (otherwise the first card pushes the transcript past the view).
+  renderTurnChanges(active)
   const prepended = !sessionChanged && previousFirstId !== undefined
     && messages.findIndex((item) => String(item.id) === previousFirstId) > 0
   const pinnedInteraction = shouldStick && !interactionArmed
@@ -165,7 +175,61 @@ export function renderMessages(active: ActiveSessionView | undefined): void {
       })
     })
   }
+  // Per-turn edited-file cards stay with the transcript, each slotted below
+  // its turn's conclusion. They are excluded from the message reconciliation
+  // loop (no messageId) and reconciled here by turn seq.
+  renderTurnChanges(active)
   setRenderedSessionId(sessionId)
+}
+
+/** Cards for finished turns, keyed by turn seq and kept with the transcript. */
+const turnChangesCards = new Map<number, ReturnType<typeof createSessionChangesCard>>()
+
+/** Drops every turn card (session switch). */
+function clearTurnChangesCards(): void {
+  for (const card of turnChangesCards.values()) card.element.remove()
+  turnChangesCards.clear()
+}
+
+/**
+ * Renders one "edited files" card per finished turn, slotting each below the
+ * conclusion message of its turn. Cards for turns whose conclusion is not in
+ * the loaded page fall to the tail of the stream; removed turns drop their
+ * card. State (show-all, dismiss) survives re-renders per card instance.
+ */
+function renderTurnChanges(active: ActiveSessionView | undefined): void {
+  const views = active?.turnChanges ?? []
+  const ids = new Set(views.map((view) => view.turn))
+  // Only delete cards when authoritative data arrived (turnChanges present but
+  // a turn is missing). A transient state push without the field must never
+  // yank the previous turn's card out of the transcript.
+  if (active?.turnChanges !== undefined) {
+    for (const [turn, card] of turnChangesCards) {
+      if (ids.has(turn)) continue
+      card.element.remove()
+      turnChangesCards.delete(turn)
+    }
+  }
+  for (const view of views) {
+    let card = turnChangesCards.get(view.turn)
+    if (card === undefined) {
+      card = createSessionChangesCard({
+        document,
+        translate: t,
+        onOpenFile: (path) => post('openFile', { path }),
+        onReview: () => post('sessionChangesReview'),
+        onUndo: () => post('sessionChangesUndo'),
+      })
+      turnChangesCards.set(view.turn, card)
+    }
+    card.update(view.changes)
+    const conclusion = elements.messages.querySelector<HTMLElement>(`article.message[data-message-id="${cssEscape(view.conclusionId)}"]`)
+    if (conclusion !== null && conclusion.nextElementSibling !== card.element) {
+      conclusion.after(card.element)
+    } else if (conclusion === null) {
+      elements.messages.append(card.element)
+    }
+  }
 }
 
 export function messageText(item: ChatItem): string {

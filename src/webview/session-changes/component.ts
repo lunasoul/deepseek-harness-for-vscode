@@ -18,15 +18,21 @@ interface ComponentOptions {
 /** Files listed before the "show N more" fold. */
 const VISIBLE_FILE_LIMIT = 3
 
+/** One self-contained "edited files" card bound to a turn's changes view. */
+export interface SessionChangesCard {
+  readonly element: HTMLElement
+  update: (changes: SessionChangesView | undefined) => void
+}
+
 /**
- * New-style "edited files" card, rendered as the final block of the turn
- * inside the message stream: a header row (file badge, "Edited N files",
- * cumulative +/− stats, Undo / Review actions) followed by the per-file list
- * with its own line counts. The signature cache keeps streamed state updates
- * from rebuilding the DOM when nothing changed.
+ * New-style "edited files" card for one finished turn: rendered inline in the
+ * message stream below that turn's conclusion. Each turn owns one card via
+ * {@link createSessionChangesCard}, so previous turns' cards stay in place
+ * instead of being replaced by the newest turn. The signature cache keeps
+ * streamed state updates from rebuilding the DOM when nothing changed.
  */
-export function createSessionChangesComponent(options: ComponentOptions): SessionChangesComponent {
-  const root = requiredElement(options.document, 'changes-bar')
+export function createSessionChangesCard(options: ComponentOptions): SessionChangesCard {
+  const root = node(options.document, 'div', 'changes-bar turn-changes-card hidden')
   let current: SessionChangesView | undefined
   let signature = ''
   let dismissedSignature = ''
@@ -90,6 +96,7 @@ export function createSessionChangesComponent(options: ComponentOptions): Sessio
   }
 
   return {
+    element: root,
     update: (changes) => {
       const nextSignature = JSON.stringify(changes ?? null)
       if (nextSignature === signature) return
@@ -142,11 +149,5 @@ function node(document: Document, tag: string, className = '', text = ''): HTMLE
   const element = document.createElement(tag)
   if (className) element.className = className
   if (text) element.textContent = text
-  return element
-}
-
-function requiredElement(document: Document, id: string): HTMLElement {
-  const element = document.getElementById(id)
-  if (element === null) throw new Error(`Missing session changes element: ${id}`)
   return element
 }
