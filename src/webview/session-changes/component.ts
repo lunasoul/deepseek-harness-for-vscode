@@ -35,7 +35,7 @@ export function createSessionChangesCard(options: ComponentOptions): SessionChan
   const root = node(options.document, 'div', 'changes-bar turn-changes-card hidden')
   let current: SessionChangesView | undefined
   let signature = ''
-  let dismissedSignature = ''
+  const dismissedSignature = ''
   let showAll = false
 
   const stats = (added: number, removed: number): HTMLElement[] => [

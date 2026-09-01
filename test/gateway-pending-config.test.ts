@@ -139,12 +139,10 @@ interface GatewayTestHarness {
   client: TestClient | undefined
   activeSessionId: string | undefined
   summaries: Map<string, { running?: boolean; blank?: boolean; agentPreset?: string; updatedAt?: number }>
-  pendingConfigurations: Map<string, unknown[]>
-  admittedSessions: Set<string>
+  pendingQueue: { pending: Map<string, unknown[]>; admitted: Set<string> }
   entries: unknown[]
   pendingCarryOver: { targetSessionId: string; message: string } | undefined
-  effortIntents: Map<string, string>
-  metaBySession: Map<string, unknown>
+  metaStore: { effortIntents: Map<string, string>; metaBySession: Map<string, unknown> }
   models:
     | {
         current: { provider: string; model: string; reasoningEffort?: string }
@@ -190,9 +188,9 @@ describe('gateway staged configuration', () => {
     expect(client.sessions.selectModel).toHaveBeenCalledTimes(1)
     expect(client.sessions.selectModel).toHaveBeenCalledWith(expect.objectContaining({ reasoningEffort: 'max' }))
     expect(client.sessions.prompt).toHaveBeenCalledTimes(1)
-    expect(service.pendingConfigurations.size).toBe(0)
+    expect(service.pendingQueue.pending.size).toBe(0)
     // The optimistic admission marker is set until the turn events arrive.
-    expect(service.admittedSessions.has('s1')).toBe(true)
+    expect(service.pendingQueue.admitted.has('s1')).toBe(true)
   })
 
   it('parks the configuration while a turn is running instead of dropping it', async () => {
@@ -203,7 +201,7 @@ describe('gateway staged configuration', () => {
 
     expect(client.sessions.selectModel).not.toHaveBeenCalled()
     expect(client.sessions.prompt).toHaveBeenCalledTimes(1)
-    expect(service.pendingConfigurations.get('s1')).toHaveLength(1)
+    expect(service.pendingQueue.pending.get('s1')).toHaveLength(1)
   })
 
   it('applies a staged model change ahead of admission when a queued prompt carries images', async () => {
@@ -221,7 +219,7 @@ describe('gateway staged configuration', () => {
     // selection, so the staged switch to deepseek-v4-flash must land first.
     expect(client.sessions.selectModel).toHaveBeenCalledTimes(1)
     expect(client.sessions.selectModel).toHaveBeenCalledWith(expect.objectContaining({ model: 'deepseek-v4-flash' }))
-    expect(service.pendingConfigurations.size).toBe(0)
+    expect(service.pendingQueue.pending.size).toBe(0)
     expect(client.sessions.prompt).toHaveBeenCalledTimes(1)
   })
 
@@ -239,7 +237,7 @@ describe('gateway staged configuration', () => {
     await service.sendPrompt('queued', 'queue', [image], config('max'))
 
     expect(client.sessions.selectModel).not.toHaveBeenCalled()
-    expect(service.pendingConfigurations.get('s1')).toHaveLength(1)
+    expect(service.pendingQueue.pending.get('s1')).toHaveLength(1)
   })
 
   it('applies the parked configuration at the next turn boundary', async () => {
@@ -253,7 +251,7 @@ describe('gateway staged configuration', () => {
 
     expect(client.sessions.selectModel).toHaveBeenCalledTimes(1)
     expect(client.sessions.selectModel).toHaveBeenCalledWith(expect.objectContaining({ reasoningEffort: 'max' }))
-    expect(service.pendingConfigurations.size).toBe(0)
+    expect(service.pendingQueue.pending.size).toBe(0)
   })
 
   it('retries a failed parked configuration at the following boundary', async () => {
@@ -264,12 +262,12 @@ describe('gateway staged configuration', () => {
 
     idleBoundary(service)
     await tick()
-    expect(service.pendingConfigurations.get('s1')).toHaveLength(1)
+    expect(service.pendingQueue.pending.get('s1')).toHaveLength(1)
 
     client.sessions.selectModel.mockResolvedValueOnce({ result: { ok: true, value: { selected: {} } } })
     idleBoundary(service)
     await tick()
-    expect(service.pendingConfigurations.size).toBe(0)
+    expect(service.pendingQueue.pending.size).toBe(0)
   })
 
   it('keeps per-prompt FIFO order instead of sharing the last selection', async () => {
@@ -278,7 +276,7 @@ describe('gateway staged configuration', () => {
 
     await service.sendPrompt('first', 'queue', [], config('max'))
     await service.sendPrompt('second', 'queue', [], config('low'))
-    expect(service.pendingConfigurations.get('s1')).toHaveLength(2)
+    expect(service.pendingQueue.pending.get('s1')).toHaveLength(2)
 
     idleBoundary(service)
     await tick()
@@ -286,7 +284,7 @@ describe('gateway staged configuration', () => {
     await tick()
 
     expect(client.sessions.selectModel.mock.calls.map((call) => call[0].reasoningEffort)).toEqual(['max', 'low'])
-    expect(service.pendingConfigurations.size).toBe(0)
+    expect(service.pendingQueue.pending.size).toBe(0)
   })
 
   it('treats a prompt admitted in the same tick as busy (no stale idle read)', async () => {
@@ -301,7 +299,7 @@ describe('gateway staged configuration', () => {
     await service.sendPrompt('second', 'queue', [], config('low'))
     expect(client.sessions.selectModel).toHaveBeenCalledTimes(1)
     expect(client.sessions.prompt).toHaveBeenCalledTimes(2)
-    expect(service.pendingConfigurations.get('s1')).toHaveLength(1)
+    expect(service.pendingQueue.pending.get('s1')).toHaveLength(1)
   })
 
   it('keeps carry-over ahead of the prompt when a mode switch creates a session', async () => {
@@ -334,32 +332,32 @@ describe('gateway staged configuration', () => {
 
     await expect(service.sendPrompt('queued', 'queue', [], config('max'))).rejects.toThrow('boom')
 
-    expect(service.pendingConfigurations.size).toBe(0)
-    expect(service.admittedSessions.has('s1')).toBe(false)
+    expect(service.pendingQueue.pending.size).toBe(0)
+    expect(service.pendingQueue.admitted.has('s1')).toBe(false)
   })
 
   it('consumes config-less queue slots without applying anything', async () => {
     const { service, client } = createService()
     service.summaries.set('s1', { running: true, blank: false, agentPreset: 'standard', updatedAt: 1 })
     await service.sendPrompt('plain', 'queue', [])
-    expect(service.pendingConfigurations.get('s1')).toHaveLength(1)
+    expect(service.pendingQueue.pending.get('s1')).toHaveLength(1)
 
     idleBoundary(service)
     await tick()
 
     expect(client.sessions.selectModel).not.toHaveBeenCalled()
-    expect(service.pendingConfigurations.size).toBe(0)
+    expect(service.pendingQueue.pending.size).toBe(0)
   })
 
   it('drops stale configurations when a queued item is withdrawn', async () => {
     const { service } = createService()
     service.summaries.set('s1', { running: true, blank: false, agentPreset: 'standard', updatedAt: 1 })
     await service.sendPrompt('queued', 'queue', [], config('max'))
-    expect(service.pendingConfigurations.get('s1')).toHaveLength(1)
+    expect(service.pendingQueue.pending.get('s1')).toHaveLength(1)
 
     await service.removeQueued('item-1')
 
-    expect(service.pendingConfigurations.size).toBe(0)
+    expect(service.pendingQueue.pending.size).toBe(0)
   })
 
   it('does not update the in-memory effort intent when persistence fails', async () => {
@@ -368,19 +366,19 @@ describe('gateway staged configuration', () => {
 
     await service.selectModel('deepseek-official', 'deepseek-v4-flash', 'low')
 
-    expect(service.effortIntents.has('s1')).toBe(false)
+    expect(service.metaStore.effortIntents.has('s1')).toBe(false)
   })
 
   it('cleans per-session persisted overlays when the host removes a session', async () => {
     const { service, persist } = createService()
-    service.effortIntents.set('s1', 'auto')
-    service.metaBySession.set('s1', { pinned: true })
+    service.metaStore.effortIntents.set('s1', 'auto')
+    service.metaStore.metaBySession.set('s1', { pinned: true })
 
     service.handleHost({ type: 'host/session-removed', sessionId: 's1' } as unknown as HostFrame)
     await tick()
 
-    expect(service.effortIntents.has('s1')).toBe(false)
-    expect(service.metaBySession.has('s1')).toBe(false)
+    expect(service.metaStore.effortIntents.has('s1')).toBe(false)
+    expect(service.metaStore.metaBySession.has('s1')).toBe(false)
     expect(persist).toHaveBeenCalled()
   })
 })

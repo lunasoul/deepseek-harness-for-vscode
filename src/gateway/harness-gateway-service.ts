@@ -1,6 +1,5 @@
 import * as vscode from 'vscode'
 import type {
-  ClientResponse,
   HistoryEntry,
   HostFrame,
   IApiClient,
@@ -9,7 +8,6 @@ import type {
   MuxFrame,
   QueuedInboxItem,
   RpcId,
-  RpcResponse,
   SessionId,
   SessionModels,
   SessionSummary,
@@ -27,26 +25,13 @@ import { isProviderRouteInUse } from '../domain/provider.js'
 import type { PromptAttachment } from '../domain/prompt-context.js'
 import { agentPresetTransition, type PromptConfiguration } from '../domain/prompt-configuration.js'
 import { conversationTitle } from '../domain/session-title.js'
-import { projectSessionChanges, type SessionChangesView } from '../domain/session-changes.js'
+import { projectSessionChanges } from '../domain/session-changes.js'
 import { isAutoEffort, resolveEffortIntent, type AutoEffortSignals, type EffortIntent, type PromptEffortSignals } from '../domain/session-effort.js'
 import { pickAutoModel, type ModelProfileInput } from '../domain/model-profile.js'
-import {
-  metaSortRank,
-  readSessionMeta,
-  setTags,
-  togglePinned,
-  type SessionMeta,
-} from '../domain/session-meta.js'
+import { setTags, togglePinned } from '../domain/session-meta.js'
 import { projectSessionStats, projectionSessionStats } from '../domain/session-stats.js'
 import { sameWorkspacePath } from '../domain/workspace-scope.js'
 import type { WorktreeService } from '../editor/worktree-service.js'
-import {
-  RESTORED_ARCHIVE_STATE_KEY,
-  isEffectivelyArchived,
-  partitionSessionLists,
-  pruneRestoredArchiveIds,
-  readRestoredArchiveIds,
-} from '../domain/archived-sessions.js'
 import {
   projectConversation,
   projectionCommands,
@@ -60,14 +45,28 @@ import {
   type HarnessWorkbenchState,
   type PendingApprovalView,
   type PendingQuestionView,
-  type QueuedPromptView,
-  type SubagentView,
-  type TurnChangesView,
-  type WorkbenchLabels,
 } from '../domain/workbench-state.js'
 import type { HarnessHostRuntime } from '../runtime/web-runtime.js'
 import type { ConnectionSettingsService } from '../services/connection-settings-service.js'
+import { ArchiveState } from './archive-state.js'
+import {
+  attachmentPart,
+  carryEventText,
+  errorMessage,
+  localizedWorkbenchLabels,
+  mergeHistory,
+  newSessionId,
+  queuedPromptView,
+  recordValue,
+  respondMessage,
+  stripApprovalTransport,
+  stripQuestionTransport,
+  subagentView,
+  valueOf,
+} from './gateway-helpers.js'
 import { NodeGatewayClient } from './node-gateway-client.js'
+import { PendingConfigurationQueue, type PendingConfigEntry } from './pending-queue.js'
+import { SessionMetaStore } from './session-meta-store.js'
 
 interface PendingApprovalRecord extends PendingApprovalView {
   readonly rpcId: RpcId
@@ -78,14 +77,6 @@ interface PendingQuestionRecord extends PendingQuestionView {
   readonly rpcId: RpcId
 }
 
-/**
- * One FIFO slot aligned with the runtime queue: a configuration awaiting
- * application at the next turn boundary, or a `none` marker keeping the
- * alignment for a queued prompt that carried no configuration.
- */
-type PendingConfigEntry =
-  | { readonly configuration: PromptConfiguration; readonly signals?: PromptEffortSignals }
-  | { readonly none: true }
 
 /**
  * Application service for the native VS Code workbench. It owns Gateway
@@ -121,42 +112,18 @@ export class HarnessGatewayService implements vscode.Disposable {
   private error: string | undefined
   private publishScheduled = false
   private selectionGeneration = 0
-  private archivedIds = new Set<string>()
-  // Sessions whose title was generated from their first user message. A
-  // session is only auto-named once; after that the title is the user's to
-  // edit, so a later message never overwrites a manual rename.
-  private readonly autoTitledSessions = new Set<string>()
-  // Restore overlay is persisted as a whole array via globalState, which is
-  // shared across VS Code windows: concurrent archive/restore from two windows
-  // is last-write-wins and may overwrite the other window's overlay. This is a
-  // known, accepted limitation of the workbench-side restore (the official
-  // runtime has no unarchive RPC); each window keeps its own in-memory view
-  // and re-syncs on the next host snapshot.
-  private restoredIds = new Set<string>()
-  private archiveRevision = 0
-  private archiveBaselineLoaded = false
-  /** Per-session reasoning-effort intent ('auto' is an extension-side layer). */
-  private readonly effortIntents = new Map<string, EffortIntent>()
-  /** Locally-owned session metadata (pin / tags). */
-  private readonly metaBySession = new Map<string, SessionMeta>()
-  /**
-   * Configurations awaiting application, FIFO-aligned with the runtime queue:
-   * one entry per prompt admitted while the session was busy. Applied at the
-   * next turn boundary so a queued prompt never loses its configuration and
-   * no running turn is ever mutated mid-flight.
-   */
-  private readonly pendingConfigurations = new Map<string, PendingConfigEntry[]>()
-  /** Sessions for which this client admitted a prompt whose turn events have
-   * not arrived yet; guards the idle fast path against same-client rapid sends. */
-  private readonly admittedSessions = new Set<string>()
+  /** FIFO of deferred prompt configurations, one slot per busy-phase prompt. */
+  private readonly pendingQueue: PendingConfigurationQueue
+  /** Locally-owned per-session state (effort intents, meta, turn cards). */
+  private readonly metaStore: SessionMetaStore
+  /** The archived-session set plus its restore overlay. */
+  private readonly archives: ArchiveState
   /**
    * Sessions whose worktree is currently being auto-merged after a turn/end.
    * Keeps two adjacent turn ends from running concurrent git operations on the
    * same worktree (index.lock races); entries are removed when the merge settles.
    */
   private readonly autoMergingSessions = new Set<string>()
-  /** Per-session finished-turn edited-file cards, kept with the transcript. */
-  private readonly turnChangesBySession = new Map<string, TurnChangesEntry[]>()
 
   readonly onDidChange = this.changeEmitter.event
 
@@ -168,10 +135,24 @@ export class HarnessGatewayService implements vscode.Disposable {
     private readonly globalState: vscode.Memento,
     private readonly worktrees: WorktreeService,
   ) {
-    this.restoredIds = new Set(readRestoredArchiveIds(globalState.get(RESTORED_ARCHIVE_STATE_KEY)))
-    loadEffortIntents(globalState.get(EFFORT_INTENT_STATE_KEY), this.effortIntents)
-    loadSessionMeta(globalState.get(SESSION_META_STATE_KEY), this.metaBySession)
-    loadTurnChanges(globalState.get(TURN_CHANGES_STATE_KEY), this.turnChangesBySession)
+    this.pendingQueue = new PendingConfigurationQueue({
+      isRunning: (sessionId) => this.summaries.get(sessionId)?.running === true,
+      apply: (configuration, signals) => this.applyPromptConfiguration(configuration, signals),
+      onApplyFailure: (message) => this.output.appendLine(vscode.l10n.t('[gateway] Failed to apply a queued configuration: {0}', message)),
+    })
+    this.metaStore = new SessionMetaStore(this.globalState, this.output)
+    this.archives = new ArchiveState({
+      globalState: this.globalState,
+      output: this.output,
+      listArchived: async () => valueOf(await this.requireClient().workspace.list({})).archivedSessionIds,
+      archiveSession: async (sessionId) => valueOf(await this.requireClient().workspace.archiveSession({
+        sessionId: sessionId as SessionId,
+      })).archivedSessionIds.map(String),
+      openSession: (sessionId) => this.openSession(sessionId),
+      createSession: async () => this.createSession(),
+      visibleSummaries: () => this.visibleSummaries(),
+      fireChange: () => this.fireChange(),
+    })
     this.runtimeSubscription = runtime.onDidChangeState((state) => {
       if (state.phase === 'error') {
         this.phase = 'error'
@@ -250,12 +231,12 @@ export class HarnessGatewayService implements vscode.Disposable {
       // out (cwd ≠ workspace folder) and greet the user with an empty history.
       const workspaceRoots = (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath)
       await this.worktrees.recover(workspaceRoots)
-      await Promise.all([this.refreshSessionList(), this.refreshArchiveSet(), this.refreshPresets()])
+      await Promise.all([this.refreshSessionList(), this.archives.refresh(), this.refreshPresets()])
       // Sweep worktrees whose session no longer exists (crash between worktree
       // add and session create, or a session removed out-of-band).
       void this.cleanupOrphanWorktrees()
       const requested = this.activeSessionId
-      const next = requested !== undefined && this.summaries.has(requested) && !this.isArchived(requested)
+      const next = requested !== undefined && this.summaries.has(requested) && !this.archives.isArchived(requested)
         ? requested
         : this.visibleSummaries()[0]?.sessionId
       if (next !== undefined) {
@@ -307,15 +288,12 @@ export class HarnessGatewayService implements vscode.Disposable {
   async snapshot(): Promise<HarnessWorkbenchState> {
     const hasApiKey = this.connectionSettings.hasConfiguredProvider()
     const scoped = this.orderedSummaries().filter((summary) => this.inCurrentWorkspace(summary))
-    const partitioned = partitionSessionLists(
-      scoped.map((summary) => {
-        const item = this.sessionListItemWithIsolation(summary)
-        const meta = this.metaFor(String(summary.sessionId))
-        return meta === undefined ? item : { ...item, meta }
-      }),
-      this.archivedIds,
-      this.restoredIds,
-    )
+    const partitioned = this.archives.partition(scoped.map((summary) => {
+      const item = this.sessionListItemWithIsolation(summary)
+      const meta = this.metaStore.metaFor(String(summary.sessionId))
+      return meta === undefined ? item : { ...item, meta }
+    }))
+
     const activeSummary = this.activeSessionId === undefined ? undefined : this.summaries.get(this.activeSessionId)
     const projected = projectConversation(this.entries, this.labels)
     const permissions = projectionPermissions(this.projections.permissions)
@@ -324,9 +302,9 @@ export class HarnessGatewayService implements vscode.Disposable {
     const tokenUsage = projectionTokenUsage(this.projections.tokenUsage)
     const contextPressure = projectionContextPressure(this.projections.contextPressure)
     const changes = projectSessionChanges(this.entries)
-    const turnChanges = activeSummary === undefined ? undefined : this.turnChangesFor(String(activeSummary.sessionId))
+    const turnChanges = activeSummary === undefined ? undefined : this.metaStore.turnChangesFor(String(activeSummary.sessionId))
     const stats = projectionSessionStats(this.projections.sessionStats) ?? projectSessionStats(this.entries)
-    const effortIntent = activeSummary === undefined ? undefined : this.effortIntents.get(String(activeSummary.sessionId))
+    const effortIntent = activeSummary === undefined ? undefined : this.metaStore.effortIntentFor(String(activeSummary.sessionId))
     const active = activeSummary === undefined ? undefined : {
       id: String(activeSummary.sessionId),
       title: sessionListItem(activeSummary, this.labels).title,
@@ -778,7 +756,7 @@ export class HarnessGatewayService implements vscode.Disposable {
         && (current.provider !== configuration.provider
           || currentModel !== stagedModel)
       const carriesImages = attachments.some((attachment) => attachment.kind === 'image')
-      if (transition === 'create-session' || !this.isSessionBusy(sessionId) || (carriesImages && changesRoute)) {
+      if (transition === 'create-session' || !this.pendingQueue.isBusy(sessionId) || (carriesImages && changesRoute)) {
         // Fresh-session forks are idle by construction; the idle fast path
         // applies in-order ahead of admission.
         await this.applyPromptConfiguration(configuration, signals)
@@ -787,12 +765,12 @@ export class HarnessGatewayService implements vscode.Disposable {
           configuration,
           ...(signals === undefined ? {} : { signals }),
         }
-        deferredEntry = this.pendConfiguration(sessionId, entry)
+        deferredEntry = this.pendingQueue.pend(sessionId, entry)
       }
     } else if (this.isSessionBusy(sessionId)) {
       // Keep the FIFO alignment with the runtime queue: a config-less prompt
       // still owns one queue slot.
-      deferredEntry = this.pendConfiguration(sessionId, { none: true })
+      deferredEntry = this.pendingQueue.pend(sessionId, { none: true })
     }
 
     // Keep the legacy ordering: staged composer settings are applied before a
@@ -807,7 +785,7 @@ export class HarnessGatewayService implements vscode.Disposable {
 
     // Optimistic admission marker: a second prompt sent in the same tick must
     // see this session as busy even before the turn events arrive.
-    if (ordinarySession) this.admittedSessions.add(target)
+    if (ordinarySession) this.pendingQueue.admit(target)
 
     // A mode-switch digest rides as its own leading text block so the
     // transcript can collapse it (see the webview carry-over card) while the
@@ -844,8 +822,8 @@ export class HarnessGatewayService implements vscode.Disposable {
       // The message never entered the queue: roll back the admission marker
       // and the pending slot so nothing is applied for a prompt that will
       // never run.
-      if (ordinarySession) this.admittedSessions.delete(target)
-      if (deferredEntry !== undefined) this.unpendConfiguration(sessionId, deferredEntry)
+      if (ordinarySession) this.pendingQueue.forget(target)
+      if (deferredEntry !== undefined) this.pendingQueue.unpend(sessionId, deferredEntry)
       throw cause
     }
   }
@@ -917,7 +895,7 @@ export class HarnessGatewayService implements vscode.Disposable {
     // Removing an item breaks the FIFO alignment between the runtime queue
     // and the pending configurations; drop them instead of applying a stale
     // configuration to the wrong prompt.
-    this.pendingConfigurations.delete(sessionId)
+    this.pendingQueue.dropForSession(sessionId)
   }
 
   /** Rewrites the text of one still-pending queued prompt. */
@@ -931,7 +909,7 @@ export class HarnessGatewayService implements vscode.Disposable {
     // Same alignment concern as removeQueued: an edited item still occupies
     // its queue slot, but its original configuration intent is no longer
     // reliably attached to it.
-    this.pendingConfigurations.delete(sessionId)
+    this.pendingQueue.dropForSession(sessionId)
   }
 
   async cancel(): Promise<void> {
@@ -1007,16 +985,7 @@ export class HarnessGatewayService implements vscode.Disposable {
     // Commit the per-session intent only after the harness accepted the
     // change, so a failed RPC cannot leave a stale intent behind.
     if (reasoningEffort !== undefined && reasoningEffort !== '') {
-      const candidate = new Map(this.effortIntents)
-      candidate.set(sessionId, isAutoEffort(reasoningEffort) ? 'auto' : reasoningEffort as EffortIntent)
-      try {
-        await this.persistEffortIntents(candidate)
-        this.effortIntents.clear()
-        for (const [key, value] of candidate) this.effortIntents.set(key, value)
-      } catch {
-        // The persistence helper logs the failure. Keep the previous in-memory
-        // intent so a failed write cannot make the UI claim a durable change.
-      }
+      await this.metaStore.setEffortIntent(sessionId, isAutoEffort(reasoningEffort) ? 'auto' : reasoningEffort as EffortIntent)
     }
     if (persist) {
       await this.configuration.setProviderIfConfigured(provider)
@@ -1037,86 +1006,20 @@ export class HarnessGatewayService implements vscode.Disposable {
   }
 
   async toggleSessionPin(sessionId: string): Promise<void> {
-    await this.updateSessionMeta(sessionId, (meta) => togglePinned(meta))
-  }
-
-  async setSessionTags(sessionId: string, tags: readonly string[]): Promise<void> {
-    await this.updateSessionMeta(sessionId, (meta) => setTags(meta, tags))
-  }
-
-  /**
-   * Persists the candidate meta before committing it to memory: a failed write
-   * must not leave a ghost state that the UI would echo as if it had worked.
-   */
-  private async updateSessionMeta(sessionId: string, update: (meta: SessionMeta | undefined) => SessionMeta): Promise<void> {
     if (!this.summaries.has(sessionId)) throw new Error(vscode.l10n.t('Session not found.'))
-    const next = update(this.metaFor(sessionId))
-    const candidate = new Map(this.metaBySession)
-    if (readSessionMeta(next) === undefined) candidate.delete(sessionId)
-    else candidate.set(sessionId, next)
-    await this.persistSessionMeta(candidate)
-    this.metaBySession.clear()
-    for (const [key, value] of candidate) this.metaBySession.set(key, value)
+    await this.metaStore.updateMeta(sessionId, (meta) => togglePinned(meta))
     this.fireChange()
   }
 
-  private metaFor(sessionId: string): SessionMeta | undefined {
-    return this.metaBySession.get(sessionId)
-  }
-
-  /** True while events or this client's own admission say a turn is running. */
-  private isTurnRunning(sessionId: string): boolean {
-    return this.summaries.get(sessionId)?.running === true || this.admittedSessions.has(sessionId)
+  async setSessionTags(sessionId: string, tags: readonly string[]): Promise<void> {
+    if (!this.summaries.has(sessionId)) throw new Error(vscode.l10n.t('Session not found.'))
+    await this.metaStore.updateMeta(sessionId, (meta) => setTags(meta, tags))
+    this.fireChange()
   }
 
   /** True when a prompt sent right now would queue behind a running turn. */
   private isSessionBusy(sessionId: string): boolean {
-    return this.isTurnRunning(sessionId)
-  }
-
-  private pendConfiguration(sessionId: string, entry: PendingConfigEntry): PendingConfigEntry {
-    const list = this.pendingConfigurations.get(sessionId)
-    if (list === undefined) this.pendingConfigurations.set(sessionId, [entry])
-    else list.push(entry)
-    return entry
-  }
-
-  private unpendConfiguration(sessionId: string, entry: PendingConfigEntry): void {
-    const list = this.pendingConfigurations.get(sessionId)
-    if (list === undefined) return
-    const index = list.indexOf(entry)
-    if (index !== -1) list.splice(index, 1)
-    if (list.length === 0) this.pendingConfigurations.delete(sessionId)
-  }
-
-  /**
-   * Applies the oldest queued configuration at a turn boundary. Runs only when
-   * no turn is believed to be running (never mutates a live turn); a skipped
-   * or failed application retries at the next boundary instead of losing the
-   * user's configuration. `none` markers are consumed to keep FIFO alignment
-   * with the runtime queue.
-   */
-  private flushPendingConfiguration(sessionId: string): void {
-    const list = this.pendingConfigurations.get(sessionId)
-    const entry = list?.[0]
-    if (entry === undefined) return
-    if (this.isTurnRunning(sessionId)) return
-    if ('none' in entry) {
-      list!.shift()
-      if (list!.length === 0) this.pendingConfigurations.delete(sessionId)
-      return
-    }
-    void this.applyPromptConfiguration(entry.configuration, entry.signals).then(
-      () => {
-        const current = this.pendingConfigurations.get(sessionId)
-        if (current === undefined || current[0] !== entry) return
-        current.shift()
-        if (current.length === 0) this.pendingConfigurations.delete(sessionId)
-      },
-      (cause: unknown) => {
-        this.output.appendLine(vscode.l10n.t('[gateway] Failed to apply a queued configuration: {0}', errorMessage(cause)))
-      },
-    )
+    return this.pendingQueue.isBusy(sessionId)
   }
 
   /** Whether the active session's host command catalog contains a slash command. */
@@ -1192,7 +1095,7 @@ export class HarnessGatewayService implements vscode.Disposable {
     }))
     // A manual rename makes the title the user's own: a later first message
     // must not overwrite it, so the session opts out of auto-titling.
-    this.autoTitledSessions.add(sessionId)
+    this.metaStore.markAutoTitled(sessionId)
     this.applyTitleProjection(sessionId, renamed.title)
     this.fireChange()
   }
@@ -1221,43 +1124,7 @@ export class HarnessGatewayService implements vscode.Disposable {
    * new-conversation stub can be hidden; unknown ids are a no-op.
    */
   async archiveSession(id: string): Promise<void> {
-    const summary = this.summaries.get(id)
-    if (summary === undefined) return
-    const snapshot = new Set(this.restoredIds)
-    this.restoredIds.delete(id)
-    try {
-      const archived = valueOf(await this.requireClient().workspace.archiveSession({
-        sessionId: id as SessionId,
-      })).archivedSessionIds
-      this.installArchivedIds(archived.map(String), false)
-    } catch (cause) {
-      await this.rollbackRestoredOverlay(snapshot, cause)
-      throw cause
-    }
-    try {
-      await this.persistRestoredIds()
-    } catch (cause) {
-      await this.rollbackRestoredOverlay(snapshot, cause)
-      throw cause
-    }
-    this.fireChange()
-  }
-
-  /**
-   * Restores the exact pre-operation overlay and flushes it to disk. A
-   * concurrent host frame may have persisted a partial overlay (the deleted id)
-   * in the background while our RPC was pending; rolling back memory alone
-   * would leave that stale partial state on disk, losing the restore after
-   * restart. Re-persisting the snapshot closes the gap.
-   */
-  private async rollbackRestoredOverlay(snapshot: ReadonlySet<string>, cause: unknown): Promise<void> {
-    this.restoredIds = new Set(snapshot)
-    try {
-      await this.persistRestoredIds()
-    } catch (persistCause) {
-      this.output.appendLine(vscode.l10n.t('[gateway] Failed to roll back the restored session list: {0}', errorMessage(persistCause)))
-    }
-    this.output.appendLine(vscode.l10n.t('[gateway] Archive operation failed: {0}', errorMessage(cause)))
+    await this.archives.archive(id, (sessionId) => this.summaries.has(sessionId))
   }
 
   /**
@@ -1356,47 +1223,7 @@ export class HarnessGatewayService implements vscode.Disposable {
       })
   }
 
-  /**
-   * Snapshots one finished turn's edited-file card so it stays with the
-   * transcript (below that turn's conclusion) instead of being replaced by
-   * the newest turn. Only the active session's entries are known here — the
-   * in-memory transcript belongs to the active conversation — so background
-   * sessions' turn cards are recorded when their turn ends while selected.
-   */
-  private recordTurnChanges(sessionId: string, event: HistoryEntry['event']): void {
-    if (sessionId !== this.activeSessionId || event.type !== 'turn/end') return
-    const turn = typeof event.data?.turn === 'number' ? event.data.turn : undefined
-    if (turn === undefined) return
-    const changes = projectSessionChanges(this.entries)
-    if (changes === undefined || changes.files.length === 0) return
-    const conclusionSeq = lastAssistantSeq(this.entries)
-    if (conclusionSeq === undefined) return
-    const existing = this.turnChangesBySession.get(sessionId) ?? []
-    const next = existing.filter((entry) => entry.turn !== turn)
-    next.push({ seq: event.seq, turn, conclusionSeq, changes })
-    next.sort((left, right) => left.turn - right.turn)
-    this.turnChangesBySession.set(sessionId, next)
-    for (const key of Array.from(this.turnChangesBySession.keys())) {
-      if (key !== sessionId && this.summaries.get(key) === undefined) this.turnChangesBySession.delete(key)
-    }
-    void this.persistTurnChanges()
-    this.fireChange()
-  }
 
-  /** The recorded turn cards for one session, in transcript order. */
-  private turnChangesFor(sessionId: string): TurnChangesView[] {
-    return (this.turnChangesBySession.get(sessionId) ?? []).map((entry) => ({
-      seq: entry.seq,
-      turn: entry.turn,
-      conclusionId: `event-${entry.conclusionSeq}`,
-      changes: entry.changes,
-    }))
-  }
-
-  /** Mirror of the turn-changes registry; writes are best-effort. */
-  private persistTurnChanges(): void {
-    void this.globalState.update(TURN_CHANGES_STATE_KEY, Object.fromEntries(this.turnChangesBySession))
-  }
 
   /** Removes an isolated session's worktree and branch; the session log stays. */
   async worktreeDiscard(sessionId: string): Promise<{ ok: boolean; message: string }> {
@@ -1425,25 +1252,7 @@ export class HarnessGatewayService implements vscode.Disposable {
    * durable overlay on the official set.
    */
   async restoreSession(sessionId: string): Promise<void> {
-    if (!this.archivedIds.has(sessionId)) return
-    const snapshot = new Set(this.restoredIds)
-    this.restoredIds.add(sessionId)
-    try {
-      await this.persistRestoredIds()
-    } catch (cause) {
-      // Roll back the exact pre-operation overlay so a failed persistence
-      // cannot report a restore that would vanish after restart, cannot drop
-      // an ID that was already present before this call, and cannot leave a
-      // stale partial overlay on disk from a concurrent host frame.
-      this.restoredIds = new Set(snapshot)
-      try {
-        await this.persistRestoredIds()
-      } catch (persistCause) {
-        this.output.appendLine(vscode.l10n.t('[gateway] Failed to roll back the restored session list: {0}', errorMessage(persistCause)))
-      }
-      throw cause
-    }
-    this.fireChange()
+    await this.archives.restore(sessionId)
   }
 
   /** Downloads the current session's log ZIP (with descendants) for saving. */
@@ -1536,10 +1345,9 @@ export class HarnessGatewayService implements vscode.Disposable {
       }
       this.maybeAutoTitle(id, frame.event)
       if (frame.event.type === 'turn/end') {
-        this.admittedSessions.delete(id)
-        this.flushPendingConfiguration(id)
+        this.pendingQueue.release(id)
         this.maybeAutoMergeWorktree(id)
-        this.recordTurnChanges(id, frame.event)
+        this.metaStore.recordTurnChanges(id, frame.event, this.entries, id === this.activeSessionId, (sessionId) => this.summaries.has(sessionId))
       }
     } else if (frame.type === 'approval/requested' && String(frame.sessionId) === this.activeSessionId) {
       const key = `approval:${String(rpcId)}`
@@ -1587,21 +1395,19 @@ export class HarnessGatewayService implements vscode.Disposable {
     } else if (frame.type === 'host/session-removed') {
       const removed = String(frame.sessionId)
       this.summaries.delete(removed)
-      this.pendingConfigurations.delete(removed)
-      this.admittedSessions.delete(removed)
-      if (this.effortIntents.delete(removed)) void this.persistEffortIntents().catch(() => undefined)
-      if (this.metaBySession.delete(removed)) void this.persistSessionMeta().catch(() => undefined)
+      this.pendingQueue.dropForSession(removed)
+      this.pendingQueue.forget(removed)
+      this.metaStore.removeSession(removed)
     } else if (frame.type === 'host/archived-sessions-changed') {
       // A host snapshot is authoritative: establish the baseline before
-      // installing the set so the sweep inside installArchivedIds treats the
-      // archived ids as authoritative, even on the first frame.
-      this.archiveBaselineLoaded = true
-      this.installArchivedIds(frame.archivedSessionIds.map(String))
+      // installing the set so the sweep inside install() treats the archived
+      // ids as authoritative, even on the first frame.
+      this.archives.installFromHost(frame.archivedSessionIds.map(String))
     } else if (frame.type === 'host/session-status') {
       const id = String(frame.sessionId)
       const summary = this.summaries.get(id)
       if (summary !== undefined) this.summaries.set(id, { ...summary, running: frame.running, blank: frame.running ? false : summary.blank })
-      if (!frame.running) this.admittedSessions.delete(id)
+      if (!frame.running) this.pendingQueue.forget(id)
     } else if (frame.type === 'host/agent-error') {
       this.output.appendLine(`[agent ${String(frame.sessionId)}] ${frame.message}`)
     } else if (frame.type === 'host/remote-event'
@@ -1656,93 +1462,11 @@ export class HarnessGatewayService implements vscode.Disposable {
     this.fireChange()
   }
 
-  private async refreshArchiveSet(): Promise<void> {
-    try {
-      const revision = this.archiveRevision
-      const archived = valueOf(await this.requireClient().workspace.list({})).archivedSessionIds
-      // Discard a stale response: a host/archived-sessions-changed event or a
-      // newer authoritative refresh may have advanced the set while this RPC
-      // was in flight. Only an up-to-date revision may replace the state.
-      if (this.archiveRevision !== revision) return
-      // Establish the baseline before installing the set: installArchivedIds
-      // sweeps the active selection, and the sweep must see the baseline as
-      // loaded to treat archived ids as authoritative.
-      this.archiveBaselineLoaded = true
-      this.installArchivedIds(archived.map(String))
-    } catch (cause) {
-      // Keep the previous set: a transient failure should not unhide archived sessions.
-      this.output.appendLine(vscode.l10n.t('[gateway] Failed to load the archived session set: {0}', errorMessage(cause)))
-    }
-    this.fireChange()
-  }
 
-  /**
-   * Applies an authoritative archived-id snapshot. With `persist` (host events
-   * and standalone refreshes) the pruned overlay is written in the background;
-   * transactional callers pass false and own the single persistRestoredIds
-   * call after the whole operation succeeds, so no concurrent write can leak
-   * a partial overlay.
-   */
-  private installArchivedIds(ids: readonly string[], persist = true): void {
-    const next = new Set(ids)
-    const pruned = pruneRestoredArchiveIds(next, this.restoredIds)
-    const archivedChanged = next.size !== this.archivedIds.size
-      || [...next].some((id) => !this.archivedIds.has(id))
-    this.archivedIds = next
-    this.archiveRevision += archivedChanged ? 1 : 0
-    if (persist && pruned.size !== this.restoredIds.size) {
-      this.restoredIds = new Set(pruned)
-      void this.persistRestoredIds().catch((cause: unknown) => {
-        // Background pruning must not fail the caller; persistRestoredIds already
-        // logs the underlying failure.
-        this.output.appendLine(vscode.l10n.t('[gateway] Failed to persist pruned restored sessions: {0}', errorMessage(cause)))
-      })
-    }
-    // Sweep after the overlay has been applied: a session that was restored in
-    // this workbench and is archived again must be swept now that its restore
-    // overlay is gone. Every authoritative archive-set change sweeps the active
-    // selection — a session archived by another window / the official Web UI,
-    // or one that became archived while offline and re-enters via the reconnect
-    // baseline — instead of staying selected while only visible in the
-    // Archived filter.
-    this.sweepArchivedSelection()
-  }
 
-  private sweepArchivedSelection(): void {
-    const active = this.activeSessionId
-    if (active === undefined) return
-    if (!this.isArchived(active)) return
-    void this.leaveArchivedSelection().catch((cause: unknown) => {
-      this.output.appendLine(vscode.l10n.t('[gateway] Failed to leave the archived session: {0}', errorMessage(cause)))
-    })
-  }
 
-  private async persistRestoredIds(): Promise<void> {
-    try {
-      await this.globalState.update(RESTORED_ARCHIVE_STATE_KEY, [...this.restoredIds])
-    } catch (cause) {
-      this.output.appendLine(vscode.l10n.t('[gateway] Failed to save the restored session list: {0}', errorMessage(cause)))
-      throw cause
-    }
-  }
 
-  private async persistEffortIntents(source: ReadonlyMap<string, EffortIntent> = this.effortIntents): Promise<void> {
-    try {
-      await this.globalState.update(EFFORT_INTENT_STATE_KEY, Object.fromEntries(source))
-    } catch (cause) {
-      this.output.appendLine(vscode.l10n.t('[gateway] Failed to save the session reasoning intent: {0}', errorMessage(cause)))
-      throw cause
-    }
-  }
 
-  private async persistSessionMeta(source: ReadonlyMap<string, SessionMeta> = this.metaBySession): Promise<void> {
-    try {
-      await this.globalState.update(SESSION_META_STATE_KEY, Object.fromEntries(source))
-    } catch (cause) {
-      this.output.appendLine(vscode.l10n.t('[gateway] Failed to save the session metadata: {0}', errorMessage(cause)))
-      throw cause
-    }
-  }
 
   /** The model's supported reasoning tiers, falling back to the harness set.
    * Provider is matched first: distinct providers may expose the same model id
@@ -1770,29 +1494,13 @@ export class HarnessGatewayService implements vscode.Disposable {
     }
   }
 
-  private isArchived(sessionId: string): boolean {
-    // Until the official archive set has been loaded once, an empty archivedIds
-    // must not be treated as authoritative: that would expose (or hide) the
-    // wrong sessions after a startup failure of workspace.list. Be conservative
-    // and treat nothing as archived until the baseline is known.
-    if (!this.archiveBaselineLoaded) return false
-    return isEffectivelyArchived(sessionId, this.archivedIds, this.restoredIds)
-  }
+
 
   private visibleSummaries(): SessionSummary[] {
-    return this.orderedSummaries().filter((summary) => !this.isArchived(String(summary.sessionId)) && this.inCurrentWorkspace(summary))
+    return this.orderedSummaries().filter((summary) => !this.archives.isArchived(String(summary.sessionId)) && this.inCurrentWorkspace(summary))
   }
 
-  private async leaveArchivedSelection(): Promise<void> {
-    const next = this.visibleSummaries()[0]
-    if (next !== undefined) {
-      // openSession resolves sub-agent rows through their parent; selectSession
-      // would route a sub-agent through the ordinary session APIs.
-      await this.openSession(String(next.sessionId))
-      return
-    }
-    await this.createSession()
-  }
+
 
   private sessionListItemWithIsolation(summary: SessionSummary): ReturnType<typeof sessionListItem> {
     const item = sessionListItem(summary, this.labels)
@@ -1811,8 +1519,8 @@ export class HarnessGatewayService implements vscode.Disposable {
 
   private orderedSummaries(): SessionSummary[] {
     return [...this.summaries.values()].sort((left, right) => {
-      const leftRank = metaSortRank(this.metaBySession.get(String(left.sessionId)))
-      const rightRank = metaSortRank(this.metaBySession.get(String(right.sessionId)))
+      const leftRank = this.metaStore.metaSortRankFor(String(left.sessionId))
+      const rightRank = this.metaStore.metaSortRankFor(String(right.sessionId))
       if (leftRank !== rightRank) return leftRank - rightRank
       return right.updatedAt - left.updatedAt
     })
@@ -1903,20 +1611,20 @@ export class HarnessGatewayService implements vscode.Disposable {
     // rename() operates on the active session only, so a background session's
     // message must never rename whatever happens to be active right now.
     if (sessionId !== this.activeSessionId) return
-    if (this.autoTitledSessions.has(sessionId)) return
-    this.autoTitledSessions.add(sessionId)
+    if (this.metaStore.isAutoTitled(sessionId)) return
+    this.metaStore.markAutoTitled(sessionId)
     const title = conversationTitle(event.data.content)
     if (title === undefined || title === '') return
     void this.rename(title).catch((cause: unknown) => {
       // A failed rename must not break the message flow; the session keeps its
       // fallback title and can be named manually from the header.
-      this.autoTitledSessions.delete(sessionId)
+      this.metaStore.clearAutoTitled(sessionId)
       this.output.appendLine(vscode.l10n.t('[gateway] Could not auto-title session {0}: {1}', sessionId, errorMessage(cause)))
     })
   }
 
   private async respond(rpcId: RpcId, value: unknown): Promise<void> {
-    const message: ClientResponse = { type: 'client-response', rpcId, result: { ok: true, value } }
+    const message = respondMessage(rpcId, value)
     const receipt = await this.requireClient().respond(message)
     if (!receipt.accepted) throw new Error(vscode.l10n.t('Harness rejected the response: {0}', receipt.reason))
   }
@@ -1968,8 +1676,7 @@ export class HarnessGatewayService implements vscode.Disposable {
     // A new connection must re-establish the official archive baseline: bump
     // the revision so any in-flight workspace.list response is discarded, and
     // clear the flag so an empty archivedIds is not treated as authoritative.
-    this.archiveRevision += 1
-    this.archiveBaselineLoaded = false
+    this.archives.markDisconnected()
   }
 
   private fireChange(): void {
@@ -1981,188 +1688,7 @@ export class HarnessGatewayService implements vscode.Disposable {
     }, 16)
   }
 }
-
-function attachmentPart(attachment: PromptAttachment): PromptContentPart {
-  if (attachment.kind === 'image') {
-    return {
-      type: 'image',
-      mediaType: attachment.mediaType,
-      data: attachment.data,
-      ...(attachment.name === undefined ? {} : { name: attachment.name }),
-    }
-  }
-  const name = attachment.file === undefined
-    ? vscode.l10n.t('Selection')
-    : attachment.file
-  const ext = name.includes('.') ? name.split('.').pop() ?? '' : ''
-  const range = attachment.startLine !== undefined && attachment.endLine !== undefined
-    ? vscode.l10n.t(' (lines {start}-{end})', { start: attachment.startLine, end: attachment.endLine })
-    : ''
-  const truncated = attachment.tooLong === true ? vscode.l10n.t(' (truncated)') : ''
-  const label = attachment.kind === 'file' ? vscode.l10n.t('File') : vscode.l10n.t('Selection')
-  return {
-    type: 'text',
-    text: `[${label}: ${name}${range}${truncated}]\n\`\`\`${ext}\n${attachment.text}\n\`\`\``,
-  }
-}
-
-function valueOf<T>(response: RpcResponse<T>): T {
-  if (!response.result.ok) throw new Error(response.result.error.message)
-  return response.result.value
-}
-
-function stripApprovalTransport(value: PendingApprovalRecord): PendingApprovalView {
-  return {
-    key: value.key,
-    toolName: value.toolName,
-    ...(value.reason === undefined ? {} : { reason: value.reason }),
-  }
-}
-
-function stripQuestionTransport(value: PendingQuestionRecord): PendingQuestionView {
-  return { key: value.key, questions: value.questions }
-}
-
-/** Reduces one pending inbox item to the small, webview-friendly queue view. */
-function queuedPromptView(item: QueuedInboxItem): QueuedPromptView {
-  const text = item.message.content
-    .filter((block): block is { readonly type: 'text'; readonly text: string } => block.type === 'text')
-    .map((block) => block.text)
-    .join('\n')
-  return {
-    id: String(item.id),
-    placement: item.placement,
-    text,
-    hasMedia: item.message.content.some((block) => block.type === 'image'),
-  }
-}
-
-function errorMessage(cause: unknown): string {
-  return cause instanceof Error ? cause.message : String(cause)
-}
-
-/**
- * Mints a session id for A2 worktree isolation. The id is created before the
- * session so the worktree can be laid out under it; the create RPC accepts a
- * preallocated id and echoes it back.
- */
-function newSessionId(): string {
-  return `dsh-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
-}
-
-function recordValue(value: unknown): Record<string, unknown> {
-  return typeof value === 'object' && value !== null ? { ...value } : {}
-}
-
-/** Merge a persistence page with live Mux events that arrived during its read. */
-function mergeHistory(base: readonly HistoryEntry[], live: readonly HistoryEntry[]): HistoryEntry[] {
-  const bySeq = new Map<number, HistoryEntry>()
-  for (const entry of base) bySeq.set(entry.event.seq, entry)
-  for (const entry of live) bySeq.set(entry.event.seq, entry)
-  return [...bySeq.values()].sort((left, right) => left.event.seq - right.event.seq)
-}
-
-/** Joins one message's content blocks into plain text for the mode-switch carry-over digest. */
-function carryEventText(blocks: readonly unknown[]): string {
-  const output: string[] = []
-  for (const block of blocks) {
-    if (typeof block !== 'object' || block === null || !('type' in block)) continue
-    const record = block as Record<string, unknown>
-    if ((record.type === 'text' || record.type === 'reasoning') && typeof record.text === 'string') {
-      output.push(record.text)
-    }
-  }
-  return output.join('\n').trim()
-}
-
-function subagentView(entry: SubagentListEntry): SubagentView {
-  if (entry.kind === 'diagnostic') return { kind: 'diagnostic', id: String(entry.id), reason: entry.reason }
-  return {
-    kind: 'child',
-    id: String(entry.id),
-    activity: entry.activity,
-    hasChildren: entry.hasChildren,
-    mode: entry.mode,
-    ...('label' in entry && entry.label !== undefined ? { label: entry.label } : {}),
-  }
-}
-
-const EFFORT_INTENT_STATE_KEY = 'deepseekHarness.sessionEffortIntents'
-const SESSION_META_STATE_KEY = 'deepseekHarness.sessionMeta'
-const TURN_CHANGES_STATE_KEY = 'deepseekHarness.sessionTurnChanges'
-/** How long the startup baseline may take before the watchdog fails the boot. */
 const START_BASELINE_TIMEOUT_S = 45
 const DEFAULT_REASONING_OPTIONS: readonly { readonly id: string }[] = [
   { id: 'off' }, { id: 'low' }, { id: 'high' }, { id: 'max' },
 ]
-
-function isEffortIntent(value: unknown): value is EffortIntent {
-  return value === 'auto' || value === 'off' || value === 'low' || value === 'high' || value === 'max'
-}
-
-function loadEffortIntents(raw: unknown, target: Map<string, EffortIntent>): void {
-  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return
-  for (const [sessionId, value] of Object.entries(raw)) {
-    if (isEffortIntent(value)) target.set(sessionId, value)
-  }
-}
-
-function loadSessionMeta(raw: unknown, target: Map<string, SessionMeta>): void {
-  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return
-  for (const [sessionId, value] of Object.entries(raw)) {
-    const meta = readSessionMeta(value)
-    if (meta !== undefined) target.set(sessionId, meta)
-  }
-}
-
-function localizedWorkbenchLabels(): WorkbenchLabels {
-  return {
-    commandModel: vscode.l10n.t('Switch the current session model (Flash / Pro)'),
-    commandReasoning: vscode.l10n.t('Switch reasoning effort (off / low / high / max)'),
-    commandPreset: vscode.l10n.t('Switch Agent Preset (standard / code / minimal / cordis)'),
-    newConversation: vscode.l10n.t('New conversation'),
-    toolResult: vscode.l10n.t('Tool result'),
-    slashCommand: vscode.l10n.t('Slash command'),
-    imageAttachment: vscode.l10n.t('[Image attachment]'),
-    completed: vscode.l10n.t('Completed'),
-    session: vscode.l10n.t('Session'),
-    context: vscode.l10n.t('Context'),
-    generationStopped: vscode.l10n.t('Generation stopped'),
-    outputLimitReached: vscode.l10n.t('Output limit reached'),
-    taskBlocked: vscode.l10n.t('Task blocked'),
-    turnFailed: vscode.l10n.t('Turn failed'),
-  }
-}
-
-/** One recorded per-turn edited-file card for a session. */
-interface TurnChangesEntry {
-  readonly seq: number
-  readonly turn: number
-  readonly conclusionSeq: number
-  readonly changes: SessionChangesView
-}
-
-/** The event seq of the last assistant message in the transcript, if any. */
-function lastAssistantSeq(entries: readonly HistoryEntry[]): number | undefined {
-  for (let index = entries.length - 1; index >= 0; index -= 1) {
-    const event = entries[index]?.event
-    if (event?.type === 'assistant/message') {
-      return typeof event.seq === 'number' ? event.seq : undefined
-    }
-  }
-  return undefined
-}
-
-function loadTurnChanges(raw: unknown, target: Map<string, TurnChangesEntry[]>): void {
-  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return
-  for (const [sessionId, value] of Object.entries(raw)) {
-    if (!Array.isArray(value)) continue
-    const entries = value.filter((entry): entry is TurnChangesEntry =>
-      typeof entry === 'object' && entry !== null
-      && typeof (entry as { seq?: unknown }).seq === 'number'
-      && typeof (entry as { turn?: unknown }).turn === 'number'
-      && typeof (entry as { conclusionSeq?: unknown }).conclusionSeq === 'number'
-      && typeof (entry as { changes?: unknown }).changes === 'object')
-    if (entries.length > 0) target.set(sessionId, entries)
-  }
-}
