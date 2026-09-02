@@ -193,6 +193,7 @@ interface GatewayTestHarness {
   sendPrompt: (text: string, mode?: 'queue' | 'steer', attachments?: unknown[], configuration?: unknown, signals?: unknown) => Promise<void>
   removeQueued: (itemId: string) => Promise<void>
   steerQueued: (itemId: string) => Promise<void>
+  createSession: (agentPreset?: string) => Promise<string>
   queue: readonly { id: string; message: { content: readonly { type: string; text?: string }[] } }[]
   selectModel: (provider: string, model: string, reasoningEffort?: string, persist?: boolean, signals?: unknown) => Promise<void>
 }
@@ -588,6 +589,82 @@ describe('gateway worktree auto-merge', () => {
     await tick()
     await tick()
     expect(calls).toBe(1)
+  })
+})
+
+describe('gateway createSession deduplication', () => {
+  /** A sessionCreate that registers the created session with sessionList. */
+  function registeringCreate(client: TestClient, createdId: string): void {
+    client.sessionCreate.mockImplementation(async () => {
+      client.sessionList.mockResolvedValue([
+        { sessionId: 's1', running: false, blank: false, agentPreset: 'standard', updatedAt: 1 },
+        { sessionId: createdId, running: false, blank: true, agentPreset: 'standard', updatedAt: 2 },
+      ])
+      return { sessionId: createdId, agentPreset: 'standard' }
+    })
+  }
+
+  it('coalesces concurrent new-session calls onto a single creation', async () => {
+    const { service, client, worktrees } = createService()
+    let resolveCreate: ((value: { sessionId: string; agentPreset: string }) => void) | undefined
+    let calls = 0
+    client.sessionCreate.mockImplementation(() => {
+      calls += 1
+      return new Promise((resolve) => { resolveCreate = resolve })
+    })
+
+    // A ＋ click storm: three calls arrive before the first settles.
+    const first = service.createSession()
+    const second = service.createSession()
+    const third = service.createSession()
+
+    client.sessionList.mockResolvedValue([
+      { sessionId: 's1', running: false, blank: false, agentPreset: 'standard', updatedAt: 1 },
+      { sessionId: 's2', running: false, blank: true, agentPreset: 'standard', updatedAt: 2 },
+    ])
+    // Let the worktree prepare microtask settle so sessionCreate (and thus
+    // resolveCreate) has actually been reached before we resolve it.
+    await tick()
+    resolveCreate?.({ sessionId: 's2', agentPreset: 'standard' })
+    const results = await Promise.all([first, second, third])
+    await tick()
+
+    expect(calls).toBe(1)
+    expect(results).toEqual(['s2', 's2', 's2'])
+    expect(worktrees.prepare).toHaveBeenCalledTimes(1)
+  }, 15_000)
+
+  it('starts a fresh creation after the previous one settles', async () => {
+    const { service, client } = createService()
+    let resolveCreate: ((value: { sessionId: string; agentPreset: string }) => void) | undefined
+    client.sessionCreate.mockImplementation(() => new Promise((resolve) => { resolveCreate = resolve }))
+
+    const first = service.createSession()
+    client.sessionList.mockResolvedValue([
+      { sessionId: 's1', running: false, blank: false, agentPreset: 'standard', updatedAt: 1 },
+      { sessionId: 's2', running: false, blank: true, agentPreset: 'standard', updatedAt: 2 },
+    ])
+    await tick()
+    resolveCreate?.({ sessionId: 's2', agentPreset: 'standard' })
+    await first
+    await tick()
+
+    registeringCreate(client, 's3')
+    const second = await service.createSession()
+    expect(client.sessionCreate).toHaveBeenCalledTimes(2)
+    expect(second).toBe('s3')
+  }, 15_000)
+
+  it('releases the dedup slot when creation fails', async () => {
+    const { service, client } = createService()
+    client.sessionCreate.mockRejectedValueOnce(new Error('boom'))
+
+    await expect(service.createSession()).rejects.toThrow('boom')
+
+    registeringCreate(client, 's4')
+    const retried = await service.createSession()
+    expect(client.sessionCreate).toHaveBeenCalledTimes(2)
+    expect(retried).toBe('s4')
   })
 })
 

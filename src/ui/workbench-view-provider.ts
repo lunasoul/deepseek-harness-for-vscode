@@ -14,7 +14,7 @@ import type { HarnessGatewayService } from '../gateway/harness-gateway-service.j
 import type { DshPluginCenterController } from '../plugins/plugin-center-controller.js'
 import type { ConnectionSettingsService } from '../services/connection-settings-service.js'
 import { workbenchHtml } from './workbench/view-html.js'
-import { isRecord, localizedOption } from './workbench/input-validators.js'
+import { isRecord, isTimeoutError, localizedOption } from './workbench/input-validators.js'
 import { handleWorkbenchMessage } from './workbench/view-messages.js'
 import type { WorkbenchViewActions } from './workbench/view-messages.js'
 
@@ -152,6 +152,13 @@ export class WorkbenchViewProvider implements vscode.WebviewViewProvider, vscode
       }, message)
     } catch (cause: unknown) {
       const detail = cause instanceof Error ? cause.message : String(cause)
+      if (isTimeoutError(cause)) {
+        // The transport aborts a request that exceeds its budget with a bare
+        // "The operation was aborted due to timeout". Surface that as an
+        // actionable message instead of a raw internal error.
+        void vscode.window.showErrorMessage(vscode.l10n.t('DeepSeek Harness: The operation timed out. Check the output log and try again.'))
+        return
+      }
       void vscode.window.showErrorMessage(vscode.l10n.t('DeepSeek Harness: {0}', detail))
     }
   }

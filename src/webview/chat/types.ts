@@ -49,7 +49,7 @@ export interface ChatElements {
   readonly historyClose: HTMLElement
   readonly historySearch: HTMLInputElement
   readonly sessionList: HTMLElement
-  readonly newSession: HTMLElement
+  readonly newSession: HTMLButtonElement
   readonly sessionTitle: HTMLButtonElement
   readonly backParent: HTMLElement
   readonly fork: HTMLButtonElement

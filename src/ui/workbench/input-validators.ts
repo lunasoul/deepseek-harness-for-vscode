@@ -13,6 +13,18 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
 }
 
+/**
+ * Whether an error is a transport timeout. AbortSignal.timeout() rejects with
+ * a DOMException named "TimeoutError" whose message is "The operation was
+ * aborted due to timeout"; some fetch stacks surface the message without the
+ * name, so both are checked.
+ */
+export function isTimeoutError(cause: unknown): boolean {
+  if (!(cause instanceof Error)) return false
+  const abortedByTimeout = /aborted due to timeout/u.test(cause.message)
+  return cause.name === 'TimeoutError' || cause.name === 'AbortError' && abortedByTimeout || abortedByTimeout
+}
+
 export function requiredString(value: Record<string, unknown>, key: string): string {
   const item = value[key]
   if (typeof item !== 'string' || item.trim() === '') throw new Error(vscode.l10n.t('Invalid {0}.', key))

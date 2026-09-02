@@ -7,6 +7,7 @@
   "Clear the DeepSeek API Key from the local Harness credential store?": "确定要从本地 Harness 凭据库清除 DeepSeek API Key 吗？",
   "DeepSeek Harness": "DeepSeek Harness",
   "DeepSeek Harness: {0}": "DeepSeek Harness：{0}",
+  "DeepSeek Harness: The operation timed out. Check the output log and try again.": "DeepSeek Harness：操作超时，请查看输出日志后重试。",
   "Create Harness Goal": "创建 Harness Goal",
   "Harness will pursue this goal until it is completed, paused, or reaches its round limit.": "Harness 会持续推进该目标，直到完成、暂停或达到轮次限制。",
   "The goal cannot be empty.": "目标不能为空。",

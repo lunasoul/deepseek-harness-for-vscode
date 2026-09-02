@@ -116,6 +116,13 @@ window.addEventListener('message', (event) => {
     }
     return
   }
+  if (event.data?.type === 'newSessionSettled') {
+    // The host finished (or failed) creating the new session: re-arm the ＋
+    // button so the next click starts a fresh creation instead of being
+    // silently swallowed.
+    elements.newSession.disabled = false
+    return
+  }
   if (event.data?.type !== 'state') return
   setWorkspaceFolderOpen(event.data.workspaceFolderOpen === true)
   setPayload(event.data)
@@ -141,11 +148,18 @@ elements.historySearch.addEventListener('input', () => {
   }
 })
 elements.newSession.addEventListener('click', () => {
+  // Creating a session runs git worktree creation plus RPCs that can take
+  // seconds. Disable the button so repeated clicks cannot fan out into a
+  // storm of concurrent createSession() calls (each of which would race the
+  // git worktree lock and produce duplicate blank drafts); the host re-arms
+  // it via 'newSessionSettled' once the flow settles.
+  if (elements.newSession.disabled) return
   components.composerConfiguration.reset()
   components.fileMention.close()
   closeTimeline()
   components.editorContext.markSubmitted()
   clearPastedImages()
+  elements.newSession.disabled = true
   post('newSession')
 })
 elements.sessionTitle.addEventListener('click', () => post('rename'))

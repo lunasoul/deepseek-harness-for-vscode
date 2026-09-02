@@ -19,7 +19,7 @@ export const elements: ChatElements = {
   historyClose: byId<HTMLElement>('history-close'),
   historySearch: byId<HTMLInputElement>('history-search'),
   sessionList: byId<HTMLElement>('session-list'),
-  newSession: byId<HTMLElement>('new-session'),
+  newSession: byId<HTMLButtonElement>('new-session'),
   sessionTitle: byId<HTMLButtonElement>('session-title'),
   backParent: byId<HTMLElement>('back-parent'),
   fork: byId<HTMLButtonElement>('fork'),

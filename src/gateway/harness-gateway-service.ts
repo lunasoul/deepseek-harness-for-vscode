@@ -132,6 +132,12 @@ export class HarnessGatewayService implements vscode.Disposable {
    * same worktree (index.lock races); entries are removed when the merge settles.
    */
   private readonly autoMergingSessions = new Set<string>()
+  /**
+   * In-flight session creations, keyed by agent preset ('' = default). A new
+   * conversation must never run two concurrent createSession() flows — see
+   * createSession() — so a click storm coalesces onto the first promise.
+   */
+  private readonly creatingSessions = new Map<string, Promise<string>>()
 
   readonly onDidChange = this.changeEmitter.event
 
@@ -437,7 +443,31 @@ export class HarnessGatewayService implements vscode.Disposable {
     this.fireChange()
   }
 
+  /**
+   * Creates a fresh session, deduplicating concurrent callers. A ＋ click storm
+   * (or a mode switch racing a click) must not fan out into N parallel
+   * `createSession()` runs: each would `git worktree add` (serialized on git's
+   * global worktree lock) and issue its own session/create RPC, so they queue
+   * on the lock, every one drags past the RPC timeout, and the user ends up
+   * with several blank drafts plus a "timed out" toast. In-flight calls with
+   * the same preset share one creation promise.
+   */
   async createSession(agentPreset?: string): Promise<string> {
+    const key = agentPreset ?? ''
+    const inFlight = this.creatingSessions.get(key)
+    if (inFlight !== undefined) return inFlight
+    const creating = this.doCreateSession(agentPreset)
+    this.creatingSessions.set(key, creating)
+    // Swallow the finally-chained rejection: callers await the original
+    // `creating` promise directly, so a failure surfaces to them, and the
+    // cleanup must not spawn its own unhandled rejection.
+    void creating.finally(() => {
+      if (this.creatingSessions.get(key) === creating) this.creatingSessions.delete(key)
+    }).catch(() => undefined)
+    return creating
+  }
+
+  private async doCreateSession(agentPreset?: string): Promise<string> {
     const client = this.requireClient()
     const config = this.configuration.get()
     const selectedPreset = agentPreset ?? config.agentPreset

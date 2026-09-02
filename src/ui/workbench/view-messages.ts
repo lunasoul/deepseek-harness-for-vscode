@@ -103,7 +103,14 @@ export interface WorkbenchViewActions {
       ctx.actions.showLogs()
       break
     case 'newSession':
-      await ctx.gateway.createSession()
+      try {
+        await ctx.gateway.createSession()
+      } finally {
+        // Re-arm the ＋ button in the webview even when creation failed: the
+        // webview disables it on click so a storm cannot fan out, and only the
+        // host knows when the flow actually settled.
+        await ctx.postToHosts({ type: 'newSessionSettled' })
+      }
       break
     case 'searchSessions': {
       const query = typeof value.query === 'string' ? value.query : ''
