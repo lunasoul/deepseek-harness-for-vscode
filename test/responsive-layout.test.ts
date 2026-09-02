@@ -2,13 +2,13 @@ import { readFile } from 'node:fs/promises'
 import { describe, expect, it } from 'vitest'
 
 const responsiveCssPath = new URL('../media/chat-responsive.css', import.meta.url)
-const providerPath = new URL('../src/ui/workbench-view-provider.ts', import.meta.url)
+const viewHtmlPath = new URL('../src/ui/workbench/view-html.ts', import.meta.url)
 
 describe('responsive workbench layout', () => {
   it('loads the responsive stylesheet after the component stylesheet', async () => {
-    const provider = await readFile(providerPath, 'utf8')
-    const componentLink = provider.indexOf('<link rel="stylesheet" href="${style}">')
-    const responsiveLink = provider.indexOf('<link rel="stylesheet" href="${responsiveStyle}">')
+    const viewHtml = await readFile(viewHtmlPath, 'utf8')
+    const componentLink = viewHtml.indexOf('<link rel="stylesheet" href="${style}">')
+    const responsiveLink = viewHtml.indexOf('<link rel="stylesheet" href="${responsiveStyle}">')
 
     expect(componentLink).toBeGreaterThan(-1)
     expect(responsiveLink).toBeGreaterThan(componentLink)

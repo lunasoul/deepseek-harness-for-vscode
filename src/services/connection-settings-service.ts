@@ -1,32 +1,46 @@
-import type {
-  ConfigurableProviderView,
-  SettingsNamespaceView,
-  SettingsPathOpView,
-} from '@deepseek-ai/dsh-host-apiproxy/api'
-import type { IApiClient } from '@deepseek-ai/dsh-client-connection/client'
+/**
+ * Adapts the upstream DSH settings/credentials/LLM control plane to the
+ * extension's deliberately small DeepSeek-source form.
+ *
+ * The wire-shape mapping helpers live in `./connection-settings/mapping.ts`
+ * and the connect-time healing passes in `./connection-settings/migrations.ts`;
+ * this class only owns state and the lifecycle.
+ */
+import type { SettingsNamespaceView, SettingsPathOpView } from '@deepseek-ai/dsh-host-apiproxy/api'
 import type { ConfigurationService } from '../config/configuration.js'
-import type {
-  ConnectionProviderView,
-  ConnectionSettingsInput,
-  ConnectionSettingsState,
-} from '../domain/connection-settings.js'
-import { validateBaseUrl } from '../domain/base-url.js'
-import { modelCapacity } from '../domain/model-capacity.js'
-import { supportsImageInput } from '../domain/model-modalities.js'
 import {
   DEEPSEEK_OFFICIAL_BASE_URL,
   DEEPSEEK_OFFICIAL_PROVIDER,
   isDeepSeekOfficialBaseUrl,
   providerKeyEnv,
   providerRoute,
-  type CustomProvider,
 } from '../domain/provider.js'
+import type {
+  ConnectionSettingsInput,
+  ConnectionSettingsState,
+} from '../domain/connection-settings.js'
 import type { CredentialStore } from '../security/credential-store.js'
+import {
+  DEEPSEEK_SETTINGS_NS,
+  PI_AI_SETTINGS_NS,
+  credentialRef,
+  credentialRefForProfile,
+  deepSeekRelayProfile,
+  normalizeInput,
+  providerView,
+  relayCompat,
+  relayModels,
+  valueAt,
+  valueOf,
+  type ProviderControlClient,
+} from './connection-settings/mapping.js'
+import { runMigrations } from './connection-settings/migrations.js'
 
-export const PI_AI_SETTINGS_NS = 'llm-pi-ai'
-export const DEEPSEEK_SETTINGS_NS = 'llm-deepseek'
+export { DEEPSEEK_SETTINGS_NS, PI_AI_SETTINGS_NS } from './connection-settings/mapping.js'
+export type { ProviderControlClient } from './connection-settings/mapping.js'
+export { runMigrations } from './connection-settings/migrations.js'
+export type { MigrationContext } from './connection-settings/migrations.js'
 
-type ProviderControlClient = Pick<IApiClient, 'settings' | 'credentials' | 'llm'>
 type Listener = () => void
 
 const EMPTY_STATE: ConnectionSettingsState = {
@@ -42,10 +56,6 @@ const EMPTY_STATE: ConnectionSettingsState = {
   }],
 }
 
-/**
- * Adapts the upstream DSH settings/credentials/LLM control plane to the
- * extension's deliberately small DeepSeek-source form.
- */
 export class ConnectionSettingsService {
   private client: ProviderControlClient | undefined
   private stateValue: ConnectionSettingsState = EMPTY_STATE
@@ -76,10 +86,11 @@ export class ConnectionSettingsService {
   /** Binds one live Gateway client and imports settings written by older builds. */
   async connect(client: ProviderControlClient): Promise<void> {
     this.client = client
-    await this.migrateLegacySettings()
-    await this.migrateRelayReasoningEfforts()
-    await this.migrateRelayCapacities()
-    await this.migrateRelayImageModalities()
+    await runMigrations({
+      client,
+      configuration: this.configuration,
+      legacyCredentials: this.legacyCredentials,
+    })
     await this.refresh()
   }
 
@@ -234,196 +245,6 @@ export class ConnectionSettingsService {
     return namespace
   }
 
-  private async migrateLegacySettings(): Promise<void> {
-    const client = this.requireClient()
-    const described = valueOf(await client.settings.describe({}))
-    if (!described.writable) return
-    const piAi = described.namespaces.find((item) => item.ns === PI_AI_SETTINGS_NS)
-    const deepSeek = described.namespaces.find((item) => item.ns === DEEPSEEK_SETTINGS_NS)
-    const legacyKey = await this.legacyCredentials.getApiKey()
-    const legacyBaseUrl = this.configuration.getLegacyBaseUrl()
-    const legacyRelay = legacyBaseUrl !== undefined && !isDeepSeekOfficialBaseUrl(legacyBaseUrl)
-      ? importedRelay(legacyBaseUrl, legacyKey)
-      : undefined
-
-    if (piAi !== undefined) {
-      const legacyProviders = [
-        ...this.configuration.getLegacyProviders(),
-        ...(legacyRelay === undefined ? [] : [legacyRelay.provider]),
-      ]
-      const ops: SettingsPathOpView[] = []
-      const pendingCredentials: { ref: string; value: string }[] = []
-      const candidates = legacyProviders.map((provider) => {
-        const route = providerRoute(provider.name)
-        const existing = valueAt(piAi.value, ['providers', route])
-        const ref = credentialRefForProfile(existing, route)
-        return { provider, route, existing, ref }
-      })
-      const refs = [...new Set(candidates.map((candidate) => candidate.ref))]
-      const credentialState = refs.length === 0
-        ? { credentials: {} }
-        : valueOf(await client.credentials.describe({ refs }))
-      for (const candidate of candidates) {
-        if (candidate.existing === undefined) {
-          ops.push({
-            op: 'set',
-            path: ['providers', candidate.route],
-            value: deepSeekRelayProfile(candidate.provider.name, candidate.provider.baseUrl, candidate.ref),
-          })
-        }
-        if (candidate.provider.apiKey.trim() !== '' && credentialState.credentials[candidate.ref]?.configured !== true) {
-          pendingCredentials.push({ ref: candidate.ref, value: candidate.provider.apiKey })
-        }
-      }
-      if (ops.length > 0) {
-        valueOf(await client.settings.mutate({ ns: PI_AI_SETTINGS_NS, ops, expectedRevision: piAi.revision }))
-      }
-      for (const credential of pendingCredentials) {
-        valueOf(await client.credentials.set(credential))
-      }
-    } else if (legacyRelay !== undefined) {
-      throw new Error('Harness cannot migrate the legacy relay because llm-pi-ai is unavailable.')
-    }
-
-    if (legacyRelay === undefined && legacyKey !== undefined && legacyKey.trim() !== '') {
-      const status = valueOf(await client.credentials.describe({ refs: ['DEEPSEEK_API_KEY'] }))
-      if (status.credentials.DEEPSEEK_API_KEY?.configured !== true) {
-        valueOf(await client.credentials.set({ ref: 'DEEPSEEK_API_KEY', value: legacyKey.trim() }))
-      }
-    }
-    if (deepSeek !== undefined && legacyBaseUrl !== undefined && legacyRelay === undefined && valueAt(deepSeek.user, ['baseURL']) === undefined) {
-      valueOf(await client.settings.mutate({
-        ns: DEEPSEEK_SETTINGS_NS,
-        ops: [{ op: 'set', path: ['baseURL'], value: legacyBaseUrl }],
-        expectedRevision: deepSeek.revision,
-      }))
-    }
-    if (legacyRelay !== undefined && this.configuration.get().provider === DEEPSEEK_OFFICIAL_PROVIDER) {
-      await this.configuration.setProvider(legacyRelay.route)
-    }
-    // Migration is complete only after every upstream write above succeeded.
-    // Remove plaintext legacy copies so DSH remains the single authority.
-    if (this.configuration.getLegacyProviders().length > 0) await this.configuration.clearLegacyProviders()
-    if (legacyKey !== undefined && legacyKey.trim() !== '') await this.legacyCredentials.clearApiKey()
-    if (legacyBaseUrl !== undefined) await this.configuration.clearLegacyBaseUrl()
-  }
-
-  /**
-   * Tops up reasoning effort maps on custom relays written by older builds.
-   * Harness 0.1.0-rc.7 added the `low` tier; relay profiles persist their own
-   * reasoningEfforts map, so existing installs keep showing the old stops
-   * until the map is healed. Idempotent: already-current maps are untouched.
-   */
-  private async migrateRelayReasoningEfforts(): Promise<void> {
-    const client = this.requireClient()
-    const described = valueOf(await client.settings.describe({}))
-    if (!described.writable) return
-    const piAi = described.namespaces.find((item) => item.ns === PI_AI_SETTINGS_NS)
-    if (piAi === undefined) return
-    const providers = valueAt(piAi.user, ['providers'])
-    if (typeof providers !== 'object' || providers === null || Array.isArray(providers)) return
-    const ops: SettingsPathOpView[] = []
-    for (const [route, profile] of Object.entries(providers)) {
-      const models = valueAt(profile, ['models'])
-      if (!Array.isArray(models)) continue
-      let changed = false
-      const upgraded = models.map((model) => {
-        if (typeof model !== 'object' || model === null || Array.isArray(model)) return model
-        const efforts = (model as Record<string, unknown>)['reasoningEfforts']
-        if (typeof efforts !== 'object' || efforts === null || Array.isArray(efforts)) return model
-        if ('low' in efforts) return model
-        changed = true
-        // Extension-written legacy maps are replaced wholesale so the stop
-        // order stays canonical; customized maps only gain the missing entry.
-        const next = isLegacyRelayReasoningEfforts(efforts)
-          ? { ...RELAY_REASONING_EFFORTS }
-          : { off: null, low: 'low', ...efforts }
-        return { ...(model as Record<string, unknown>), reasoningEfforts: next }
-      })
-      if (changed) ops.push({ op: 'set', path: ['providers', route, 'models'], value: upgraded })
-    }
-    if (ops.length === 0) return
-    valueOf(await client.settings.mutate({ ns: PI_AI_SETTINGS_NS, ops, expectedRevision: piAi.revision }))
-  }
-
-  /**
-   * Fills in contextWindow/maxTokens on relay models written by older builds.
-   * The pi-ai adapter falls back to a 256K default when a model entry carries
-   * no capacity, which misstates 1M-window models; writing the known capacity
-   * makes the context meter accurate for Auto and manual selections alike.
-   * Idempotent: entries that already carry a capacity are untouched, and ids
-   * outside the capacity table keep their entries as-is.
-   */
-  private async migrateRelayCapacities(): Promise<void> {
-    const client = this.requireClient()
-    const described = valueOf(await client.settings.describe({}))
-    if (!described.writable) return
-    const piAi = described.namespaces.find((item) => item.ns === PI_AI_SETTINGS_NS)
-    if (piAi === undefined) return
-    const providers = valueAt(piAi.user, ['providers'])
-    if (typeof providers !== 'object' || providers === null || Array.isArray(providers)) return
-    const ops: SettingsPathOpView[] = []
-    for (const [route, profile] of Object.entries(providers)) {
-      const models = valueAt(profile, ['models'])
-      if (!Array.isArray(models)) continue
-      let changed = false
-      const upgraded = models.map((model) => {
-        if (typeof model !== 'object' || model === null || Array.isArray(model)) return model
-        const record = model as Record<string, unknown>
-        const id = record['id']
-        if (typeof id !== 'string' || record['contextWindow'] !== undefined) return model
-        const capacity = modelCapacity(id)
-        if (capacity === undefined) return model
-        changed = true
-        return {
-          ...record,
-          contextWindow: capacity.contextWindow,
-          ...(capacity.maxTokens === undefined ? {} : { maxTokens: capacity.maxTokens }),
-        }
-      })
-      if (changed) ops.push({ op: 'set', path: ['providers', route, 'models'], value: upgraded })
-    }
-    if (ops.length === 0) return
-    valueOf(await client.settings.mutate({ ns: PI_AI_SETTINGS_NS, ops, expectedRevision: piAi.revision }))
-  }
-
-  /**
-   * Declares image input on relay vision models written by older builds. The
-   * pi-ai adapter serves an entry without `input` as text-only, so a relay
-   * vision model rejected image prompts even after the session switched to it.
-   * Idempotent: entries that already declare modalities are untouched, and ids
-   * without the vision naming convention keep their entries as-is.
-   */
-  private async migrateRelayImageModalities(): Promise<void> {
-    const client = this.requireClient()
-    const described = valueOf(await client.settings.describe({}))
-    if (!described.writable) return
-    const piAi = described.namespaces.find((item) => item.ns === PI_AI_SETTINGS_NS)
-    if (piAi === undefined) return
-    const providers = valueAt(piAi.user, ['providers'])
-    if (typeof providers !== 'object' || providers === null || Array.isArray(providers)) return
-    const ops: SettingsPathOpView[] = []
-    for (const [route, profile] of Object.entries(providers)) {
-      const models = valueAt(profile, ['models'])
-      if (!Array.isArray(models)) continue
-      let changed = false
-      const upgraded = models.map((model) => {
-        if (typeof model !== 'object' || model === null || Array.isArray(model)) return model
-        const record = model as Record<string, unknown>
-        const id = record['id']
-        if (typeof id !== 'string' || !supportsImageInput(id)) return model
-        // pi-ai's declaredInput treats an empty list as undeclared too.
-        const input = record['input']
-        if (Array.isArray(input) && input.length > 0) return model
-        changed = true
-        return { ...record, input: ['text', 'image'] }
-      })
-      if (changed) ops.push({ op: 'set', path: ['providers', route, 'models'], value: upgraded })
-    }
-    if (ops.length === 0) return
-    valueOf(await client.settings.mutate({ ns: PI_AI_SETTINGS_NS, ops, expectedRevision: piAi.revision }))
-  }
-
   private requireClient(): ProviderControlClient {
     if (this.client === undefined) throw new Error('Harness Gateway is not connected.')
     return this.client
@@ -433,156 +254,4 @@ export class ConnectionSettingsService {
     this.stateValue = state
     for (const listener of this.listeners) listener()
   }
-}
-
-function importedRelay(baseUrl: string, apiKey: string | undefined): {
-  route: string
-  provider: CustomProvider
-} {
-  const hostname = new URL(baseUrl).hostname.replace(/^www\./u, '')
-  const name = `Imported ${hostname}`
-  return {
-    route: providerRoute(name),
-    provider: { name, baseUrl, apiKey: apiKey?.trim() ?? '' },
-  }
-}
-
-function normalizeInput(input: ConnectionSettingsInput): ConnectionSettingsInput {
-  const name = input.name.trim()
-  const baseUrl = input.baseUrl.trim()
-  const apiKey = input.apiKey.trim()
-  if (input.provider !== DEEPSEEK_OFFICIAL_PROVIDER && name === '') throw new Error('The provider name cannot be empty.')
-  if (baseUrl === '') {
-    if (input.provider === DEEPSEEK_OFFICIAL_PROVIDER) {
-      return { ...input, name, baseUrl: DEEPSEEK_OFFICIAL_BASE_URL, apiKey }
-    }
-    throw new Error('The provider base URL cannot be empty.')
-  }
-  if (!validateBaseUrl(baseUrl).valid) throw new Error('The Base URL must be a valid http(s) URL.')
-  const models = input.provider === DEEPSEEK_OFFICIAL_PROVIDER
-    ? []
-    : normalizeRelayModels(input.models)
-  return { ...input, name, baseUrl, apiKey, models }
-}
-
-/**
- * A custom relay endpoint is addressed by the model ids it actually exposes
- * (e.g. a Volcengine Ark model id or endpoint). Empty input keeps the
- * extension's DeepSeek defaults so existing behavior is preserved.
- */
-function normalizeRelayModels(models: readonly string[] | undefined): readonly string[] {
-  const ids = (models ?? [])
-    .map((model) => model.trim())
-    .filter((model) => model !== '')
-  return [...new Set(ids)]
-}
-
-/** Reasoning effort wire map the extension writes for custom relay models. */
-const RELAY_REASONING_EFFORTS = { off: null, low: 'low', high: 'high', max: 'max' } as const
-
-/** Map shape written by builds before the low tier existed (pre rc.7). */
-const LEGACY_RELAY_REASONING_EFFORTS = { off: null, high: 'high', max: 'max' } as const
-
-function isLegacyRelayReasoningEfforts(efforts: object): boolean {
-  const entries = Object.entries(efforts)
-  const legacy = Object.entries(LEGACY_RELAY_REASONING_EFFORTS) as [string, unknown][]
-  return entries.length === legacy.length
-    && legacy.every(([key, value]) => (efforts as Record<string, unknown>)[key] === value)
-}
-
-function relayModels(models: readonly string[]): { id: string; reasoningEfforts: object; input?: readonly string[]; contextWindow?: number; maxTokens?: number }[] {
-  const ids = models.length > 0 ? models : ['deepseek-v4-flash', 'deepseek-v4-pro', 'deepseek-v4-flash-vision-exp']
-  return ids.map((id) => {
-    const capacity = modelCapacity(id)
-    return {
-      id,
-      reasoningEfforts: { ...RELAY_REASONING_EFFORTS },
-      // The pi-ai adapter serves an entry without `input` as text-only, so a
-      // vision route must declare its modalities or image prompts are rejected
-      // at admission even after the session switched to it.
-      ...(supportsImageInput(id) ? { input: ['text', 'image'] } : {}),
-      ...(capacity === undefined ? {} : {
-        contextWindow: capacity.contextWindow,
-        ...(capacity.maxTokens === undefined ? {} : { maxTokens: capacity.maxTokens }),
-      }),
-    }
-  })
-}
-
-function deepSeekRelayProfile(displayName: string, baseURL: string, apiKeyEnv: string, models?: readonly string[]): object {
-  return {
-    displayName,
-    apiKeyEnv,
-    api: 'openai-completions',
-    baseURL,
-    compat: relayCompat(),
-    models: relayModels(models ?? []),
-  }
-}
-
-function relayCompat(): object {
-  return {
-    thinkingFormat: 'deepseek',
-    supportsReasoningEffort: true,
-    supportsDeveloperRole: false,
-  }
-}
-
-function providerView(
-  entry: ConfigurableProviderView,
-  namespace: SettingsNamespaceView | undefined,
-  credential: { readonly configured: boolean; readonly writable: boolean } | undefined,
-): ConnectionProviderView {
-  const profile = valueAt(namespace?.value, entry.settingsPath)
-  const baseUrl = stringField(profile, 'baseURL')
-    ?? (entry.provider === DEEPSEEK_OFFICIAL_PROVIDER ? DEEPSEEK_OFFICIAL_BASE_URL : '')
-  return {
-    id: entry.provider,
-    name: entry.displayName,
-    baseUrl,
-    models: modelsField(profile),
-    apiKeyConfigured: credential?.configured === true,
-    credentialWritable: credential?.writable === true,
-    removable: entry.settingsPath.length > 0 && valueAt(namespace?.user, entry.settingsPath) !== undefined,
-  }
-}
-
-function credentialRef(entry: ConfigurableProviderView, namespace: SettingsNamespaceView | undefined): string {
-  if (entry.provider === DEEPSEEK_OFFICIAL_PROVIDER) return 'DEEPSEEK_API_KEY'
-  return credentialRefForProfile(valueAt(namespace?.value, entry.settingsPath), entry.provider)
-}
-
-function credentialRefForProfile(profile: unknown, provider: string): string {
-  return stringField(profile, 'apiKeyEnv') ?? providerKeyEnv(provider)
-}
-
-function stringField(value: unknown, key: string): string | undefined {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
-  const field = (value as Record<string, unknown>)[key]
-  return typeof field === 'string' && field.trim() !== '' ? field.trim() : undefined
-}
-
-function modelsField(value: unknown): readonly string[] {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) return []
-  const models = (value as Record<string, unknown>)['models']
-  if (!Array.isArray(models)) return []
-  return models
-    .map((model) => (typeof model === 'object' && model !== null
-      ? stringField(model, 'id')
-      : typeof model === 'string' ? model : undefined))
-    .filter((model): model is string => model !== undefined)
-}
-
-function valueAt(root: unknown, path: readonly string[]): unknown {
-  let current = root
-  for (const key of path) {
-    if (typeof current !== 'object' || current === null || Array.isArray(current)) return undefined
-    current = (current as Record<string, unknown>)[key]
-  }
-  return current
-}
-
-function valueOf<T>(response: { readonly result: { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: { readonly message: string } } }): T {
-  if (!response.result.ok) throw new Error(response.result.error.message)
-  return response.result.value
 }

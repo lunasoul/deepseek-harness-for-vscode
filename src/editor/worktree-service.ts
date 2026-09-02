@@ -1,14 +1,35 @@
-import { execFile } from 'node:child_process'
-import { appendFile, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
-import type { ExecFileOptions } from 'node:child_process'
+/**
+ * Per-session git worktree isolation (plan A2).
+ *
+ * Every new session gets its own worktree checked out on a dedicated branch
+ * `dsh/<sessionId>`, and that worktree path becomes the session cwd. Because
+ * the DSH workspace-write sandbox fences writes under the session cwd, each
+ * session's sandbox boundary is automatically its own worktree — the agent can
+ * touch nothing outside it, and no session can clobber another's edits in the
+ * shared repo. Non-git workspaces fall back to the shared cwd.
+ *
+ * The shell-layer git helpers this class drives live in `./worktree-git.ts`.
+ */
+import type * as vscode from 'vscode'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
-import { promisify } from 'node:util'
-import type * as vscode from 'vscode'
+import { rm } from 'node:fs/promises'
+import {
+  currentBranch,
+  defaultBranch,
+  dirnameLike,
+  gitRoot,
+  ignoreDshWorktrees,
+  joinPathLike,
+  listSubdirectories,
+  pathExists,
+  runGit,
+  worktreeDirty,
+} from './worktree-git.js'
+import type { GitRunner } from './worktree-git.js'
 
-const execFileAsync = promisify(execFile)
-
-export type ExecResult = { stdout: string; stderr: string }
+export type { ExecResult, GitRunner } from './worktree-git.js'
 
 /** One worktree owned by one session: the session's sandbox root (cwd). */
 export interface WorktreeRecord {
@@ -44,9 +65,6 @@ export interface DiscardOutcome {
   readonly message: string
 }
 
-/** Injectable git runner so tests never touch a real repository. */
-export type GitRunner = (cwd: string, args: readonly string[]) => Promise<ExecResult>
-
 const REGISTRY_KEY = 'dsh.worktrees.v1'
 /**
  * Mirror of the registry written inside each repository's `.git` directory.
@@ -56,16 +74,6 @@ const REGISTRY_KEY = 'dsh.worktrees.v1'
  */
 const DISK_REGISTRY_FILE = 'dsh-worktrees.json'
 
-/**
- * Per-session git worktree isolation (plan A2).
- *
- * Every new session gets its own worktree checked out on a dedicated branch
- * `dsh/<sessionId>`, and that worktree path becomes the session cwd. Because
- * the DSH workspace-write sandbox fences writes under the session cwd, each
- * session's sandbox boundary is automatically its own worktree — the agent can
- * touch nothing outside it, and no session can clobber another's edits in the
- * shared repo. Non-git workspaces fall back to the shared cwd.
- */
 export class WorktreeService implements vscode.Disposable {
   private readonly records = new Map<string, WorktreeRecord>()
 
@@ -424,121 +432,4 @@ export class WorktreeService implements vscode.Disposable {
       await writeFile(file, JSON.stringify(records, null, 2)).catch(() => undefined)
     }
   }
-}
-
-/**
- * Probes the git binary and the workspace's repository status in one call.
- * A missing `git` executable (`ENOENT` from the child process) is reported
- * separately from a non-git directory so the caller can tell the user apart:
- * "install Git / add it to PATH" vs "this folder is not a repository".
- */
-async function gitRoot(run: GitRunner, cwd: string): Promise<{ root: string | undefined; gitNotFound: boolean }> {
-  try {
-    const { stdout } = await run(cwd, ['rev-parse', '--show-toplevel'])
-    const root = stdout.trim()
-    return { root: root === '' ? undefined : root, gitNotFound: false }
-  } catch (error) {
-    return { root: undefined, gitNotFound: isGitNotFound(error) }
-  }
-}
-
-/** Whether a git invocation failed because the executable itself is absent. */
-function isGitNotFound(error: unknown): boolean {
-  return (error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT'
-}
-
-async function currentBranch(run: GitRunner, repoRoot: string): Promise<string | undefined> {
-  try {
-    const { stdout } = await run(repoRoot, ['rev-parse', '--abbrev-ref', 'HEAD'])
-    const branch = stdout.trim()
-    return branch === 'HEAD' ? undefined : branch
-  } catch {
-    return undefined
-  }
-}
-
-/** Whether the main worktree has uncommitted changes (porcelain status non-empty). */
-async function worktreeDirty(run: GitRunner, repoRoot: string): Promise<boolean> {
-  try {
-    const { stdout } = await run(repoRoot, ['status', '--porcelain'])
-    return stdout.trim() !== ''
-  } catch {
-    // If status is unreadable, err on the side of not touching the worktree.
-    return true
-  }
-}
-
-/** Whether a path exists on disk (worktree directories are the usual target). */
-async function pathExists(target: string): Promise<boolean> {
-  try {
-    await stat(target)
-    return true
-  } catch {
-    return false
-  }
-}
-
-/** Immediate subdirectories of `dir` (skips files and unreadable entries). */
-async function listSubdirectories(dir: string): Promise<string[]> {
-  try {
-    const entries = await readdir(dir, { withFileTypes: true })
-    return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name)
-  } catch {
-    return []
-  }
-}
-
-/** The repository's default branch (origin/HEAD), falling back to `main`. */
-async function defaultBranch(run: GitRunner, repoRoot: string): Promise<string> {
-  try {
-    const { stdout } = await run(repoRoot, ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'])
-    const branch = stdout.trim()
-    if (branch !== '' && !branch.endsWith('/HEAD')) return branch.replace(/^origin\//u, '')
-  } catch {
-    // origin/HEAD is unset for local-only repositories.
-  }
-  return 'main'
-}
-
-function runGit(cwd: string, args: readonly string[]): Promise<ExecResult> {
-  const options: ExecFileOptions = { cwd, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 }
-  return execFileAsync('git', [...args], options) as Promise<ExecResult>
-}
-
-const EXCLUDE_ENTRY = '.dsh-worktrees/\n'
-
-/**
- * Ensures `.dsh-worktrees/` is ignored by the repository (via the local, never
- * committed `.git/info/exclude`) so the isolation directory and its worktrees
- * do not pollute `git status` of the main checkout. Best-effort: a failure
- * here never fails session creation.
- */
-async function ignoreDshWorktrees(repoRoot: string): Promise<void> {
-  try {
-    const gitDir = joinPathLike(repoRoot, '.git', 'info', 'exclude')
-    let content = ''
-    try {
-      content = await readFile(gitDir, 'utf8')
-    } catch {
-      await mkdir(dirnameLike(repoRoot, gitDir), { recursive: true })
-    }
-    if (content.split('\n').includes('.dsh-worktrees/')) return
-    await appendFile(gitDir, content.endsWith('\n') ? EXCLUDE_ENTRY : `\n${EXCLUDE_ENTRY}`)
-  } catch {
-    // Never fail session creation over an exclude-entry nicety.
-  }
-}
-
-/** Preserve the separator style returned by the injected/real git root. */
-function joinPathLike(root: string, ...parts: string[]): string {
-  const join = isWindowsPath(root) ? path.win32.join : path.posix.join
-  return join(root, ...parts).replaceAll('\\', '/')
-}
-
-function dirnameLike(root: string, value: string): string {
-  return isWindowsPath(root) ? path.win32.dirname(value) : path.posix.dirname(value)
-}
-
-function isWindowsPath(value: string): boolean {
-  return /^[A-Za-z]:[\\/]/u.test(value) || value.includes('\\')
 }

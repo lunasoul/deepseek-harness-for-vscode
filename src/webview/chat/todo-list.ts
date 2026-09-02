@@ -1,4 +1,4 @@
-import { todoGlyph, type TodoEntry } from '../../domain/todo-view.js'
+import type { TodoEntry } from '../../domain/todo-view.js'
 import { node } from './context.js'
 
 export type { TodoEntry } from '../../domain/todo-view.js'

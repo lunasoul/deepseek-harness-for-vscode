@@ -124,9 +124,9 @@ function createService(options: {
 
   // Seed the official archive set and baseline so the tests exercise the
   // post-baseline behaviour.
-  service.archivedIds = new Set(options.archived ?? [])
-  service.archiveBaselineLoaded = true
-  if (options.archived !== undefined) service.archiveRevision += 1
+  service.archives.archivedIds = new Set(options.archived ?? [])
+  service.archives.baselineLoaded = true
+  if (options.archived !== undefined) service.archives.revision += 1
   service.client = client
   return { service, client }
 }
@@ -135,43 +135,45 @@ function createService(options: {
 interface GatewayTestHarness {
   client: TestClient | undefined
   summaries: Map<string, { blank?: boolean; origin?: string; parentSessionId?: string }>
-  archivedIds: Set<string>
-  restoredIds: Set<string>
-  archiveRevision: number
-  archiveBaselineLoaded: boolean
+  archives: {
+    archivedIds: Set<string>
+    restoredIds: Set<string>
+    revision: number
+    baselineLoaded: boolean
+    install: (ids: readonly string[], persist?: boolean) => void
+    isArchived: (id: string) => boolean
+    refresh: () => Promise<void>
+    archive: (id: string, exists: (id: string) => boolean) => Promise<void>
+  }
   activeSessionId: string | undefined
   globalState: { get: (key: string) => unknown; update: (key: string, value: unknown) => Promise<void> }
   fireChange: () => void
-  installArchivedIds: (ids: readonly string[], persist?: boolean) => void
-  isArchived: (id: string) => boolean
-  refreshArchiveSet: () => Promise<void>
-  archiveSession: (id: string) => Promise<void>
 }
 
 describe('HarnessGatewayService archive overlay', () => {
   it('discards a stale workspace.list response after a host archive frame advanced the revision', async () => {
     const { service, client } = createService({ archived: [] })
-    service.archivedIds = new Set()
+    service.archives.archivedIds = new Set()
 
     // Simulate refreshArchiveSet issuing workspace.list (revision captured),
     // then a host frame updating the set before the RPC settles.
     client.workspace.list.mockImplementation(async () => {
-      service.installArchivedIds(['a'], true) // host frame wins
+      service.archives.install(['a'], true) // host frame wins
       return { result: { ok: true, value: { archivedSessionIds: [] } } }
     })
-    await service.refreshArchiveSet()
+    await service.archives.refresh()
 
     // The stale [] response must not clobber the host's ['a'].
-    expect(service.isArchived('a')).toBe(true)
-    expect(service.archivedIds.has('a')).toBe(true)
+    expect(service.archives.isArchived('a')).toBe(true)
+    expect(service.archives.archivedIds.has('a')).toBe(true)
   })
 
   it('applies a workspace.list response that is still current', async () => {
     const { service, client } = createService({ archived: [] })
     client.workspace.list.mockResolvedValue({ result: { ok: true, value: { archivedSessionIds: ['b'] } } })
-    await service.refreshArchiveSet()
-    expect(service.archivedIds.has('b')).toBe(true)
-    expect(service.archiveBaselineLoaded).toBe(true)
+    await service.archives.refresh()
+    expect(service.archives.archivedIds.has('b')).toBe(true)
+    expect(service.archives.baselineLoaded).toBe(true)
   })
 
   it('restores the exact overlay snapshot when archiveSession persistence fails', async () => {
@@ -181,30 +183,30 @@ describe('HarnessGatewayService archive overlay', () => {
     // Force the persist step to fail after the RPC succeeded.
     service.globalState.update = async () => { throw new Error('disk full') }
 
-    await expect(service.archiveSession('target')).rejects.toThrow('disk full')
+    await expect(service.archives.archive('target', (id) => service.summaries.has(id))).rejects.toThrow('disk full')
     // The unrelated overlay id survives; the failed archive id is rolled back.
-    expect(service.restoredIds.has('keep')).toBe(true)
-    expect(service.restoredIds.has('target')).toBe(false)
+    expect(service.archives.restoredIds.has('keep')).toBe(true)
+    expect(service.archives.restoredIds.has('target')).toBe(false)
   })
 
   it('treats nothing as archived until the baseline is loaded', () => {
     const { service } = createService({ archived: ['hidden'] })
-    service.archiveBaselineLoaded = false
-    service.archivedIds = new Set(['hidden'])
-    expect(service.isArchived('hidden')).toBe(false)
+    service.archives.baselineLoaded = false
+    service.archives.archivedIds = new Set(['hidden'])
+    expect(service.archives.isArchived('hidden')).toBe(false)
   })
 
   it('sweeps a session the host frame archives (no restore overlay)', () => {
     const { service } = createService({ archived: [] })
     service.activeSessionId = 'active'
-    service.archivedIds = new Set()
+    service.archives.archivedIds = new Set()
     // host/archived-sessions-changed archives the open session; without a
     // restore overlay it becomes archived and the sweep runs. In this harness
     // the fallback selection cannot resolve without a live client, so the
     // sweep's leaveArchivedSelection fails safely and logs; the invariant
     // under test is that the session is now considered archived.
-    service.installArchivedIds(['active'], true)
-    expect(service.isArchived('active')).toBe(true)
+    service.archives.install(['active'], true)
+    expect(service.archives.isArchived('active')).toBe(true)
   })
 
   it('archives a blank draft so unwanted new-conversation stubs can be hidden', async () => {
@@ -212,9 +214,9 @@ describe('HarnessGatewayService archive overlay', () => {
     service.summaries.set('blank-draft', { blank: true })
     client.workspace.archiveSession.mockResolvedValue({ result: { ok: true, value: { archivedSessionIds: ['blank-draft'] } } })
 
-    await service.archiveSession('blank-draft')
+    await service.archives.archive('blank-draft', (id) => service.summaries.has(id))
 
     expect(client.workspace.archiveSession).toHaveBeenCalledWith({ sessionId: 'blank-draft' })
-    expect(service.isArchived('blank-draft')).toBe(true)
+    expect(service.archives.isArchived('blank-draft')).toBe(true)
   })
 })
