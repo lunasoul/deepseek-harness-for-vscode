@@ -14,7 +14,7 @@ import type { HarnessGatewayService } from '../gateway/harness-gateway-service.j
 import type { DshPluginCenterController } from '../plugins/plugin-center-controller.js'
 import type { ConnectionSettingsService } from '../services/connection-settings-service.js'
 import { workbenchHtml } from './workbench/view-html.js'
-import { localizedOption } from './workbench/input-validators.js'
+import { isRecord, localizedOption } from './workbench/input-validators.js'
 import { handleWorkbenchMessage } from './workbench/view-messages.js'
 import type { WorkbenchViewActions } from './workbench/view-messages.js'
 
@@ -27,6 +27,7 @@ export class WorkbenchViewProvider implements vscode.WebviewViewProvider, vscode
 
   private view: vscode.WebviewView | undefined
   private panel: vscode.WebviewPanel | undefined
+  private viewSubscription: vscode.Disposable | undefined
   private readonly subscriptions: vscode.Disposable[]
   private publishing: Promise<void> | undefined
   private publishPending = false
@@ -57,6 +58,10 @@ export class WorkbenchViewProvider implements vscode.WebviewViewProvider, vscode
   }
 
   resolveWebviewView(view: vscode.WebviewView): void {
+    // Drag-to-editor re-resolves this view into a fresh webview (and back
+    // again). Drop the previous message subscription so a re-resolved view
+    // never dispatches the same message twice or leaks a stale handler.
+    this.viewSubscription?.dispose()
     this.view = view
     view.webview.options = {
       enableScripts: true,
@@ -66,9 +71,19 @@ export class WorkbenchViewProvider implements vscode.WebviewViewProvider, vscode
       ],
     }
     view.webview.html = workbenchHtml(view.webview, this.extensionUri)
-    this.subscriptions.push(view.webview.onDidReceiveMessage((message: unknown) => {
+    this.viewSubscription = view.webview.onDidReceiveMessage((message: unknown) => {
       void this.dispatchMessage(message)
+    })
+    this.subscriptions.push(view.onDidChangeVisibility(() => {
+      // Re-push the latest state whenever the view is shown (drag between the
+      // sidebar and the editor re-resolves it; a hidden view resumes with an
+      // empty DOM otherwise).
+      if (view.visible) void this.publishState().catch(() => undefined)
     }))
+    // Push immediately as well: the webview's own 'ready' races the gateway
+    // baseline, and a view restored into the editor area may resolve while the
+    // sidebar (if any) already consumed the last snapshot.
+    void this.publishState().catch(() => undefined)
     void this.gateway.start()
   }
 
@@ -77,6 +92,7 @@ export class WorkbenchViewProvider implements vscode.WebviewViewProvider, vscode
   }
 
   dispose(): void {
+    this.viewSubscription?.dispose()
     for (const subscription of this.subscriptions) subscription.dispose()
     this.panel?.dispose()
   }
@@ -115,6 +131,14 @@ export class WorkbenchViewProvider implements vscode.WebviewViewProvider, vscode
 
   /** One error surface for every message that fails, view and panel alike. */
   private async dispatchMessage(message: unknown): Promise<void> {
+    if (isRecord(message) && message.type === 'webviewError') {
+      // Webview-side exceptions (blank panel diagnostics) land in the host
+      // log with the same [webview] prefix we can grep for.
+      console.error('[webview]', String(message.message ?? 'unknown webview error'))
+      const name = 'deepseekHarness-renderer-error'
+      vscode.window.createOutputChannel(name, { log: true }).appendLine(String(message.message ?? 'unknown webview error'))
+      return
+    }
     try {
       await handleWorkbenchMessage({
         gateway: this.gateway,

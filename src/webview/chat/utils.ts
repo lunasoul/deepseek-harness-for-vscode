@@ -29,9 +29,21 @@ export function captureDisclosures(root: HTMLElement): Map<string, boolean> {
 
 export function restoreDisclosures(root: HTMLElement, state: Map<string, boolean>): void {
   for (const details of disclosureElements(root)) {
-    if (details.dataset.autoOpen === 'true') details.open = true
-    else if (details.dataset.autoOpen === 'false') details.open = false
-    else details.open = state.get(details.dataset.disclosureKey || '') === true
+    // autoOpen='true' always reopens (live todo cards). autoOpen='false' is a
+    // *default*, not a lock: the reader's explicit expand/collapse must win
+    // across rebuilds, so a collapsed-default block that the user opened stays
+    // open (and a history reasoning card never snaps shut just because a newer
+    // reasoning block below forces a full re-render). The captured state is the
+    // source of truth; only a never-seen block falls back to the default.
+    if (details.dataset.autoOpen === 'true') {
+      details.open = true
+    } else if (details.dataset.autoOpen === 'false') {
+      details.open = state.has(details.dataset.disclosureKey || '')
+        ? state.get(details.dataset.disclosureKey || '') === true
+        : false
+    } else {
+      details.open = state.get(details.dataset.disclosureKey || '') === true
+    }
   }
 }
 

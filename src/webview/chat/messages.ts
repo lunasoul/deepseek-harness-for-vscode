@@ -223,13 +223,49 @@ function renderTurnChanges(active: ActiveSessionView | undefined): void {
       turnChangesCards.set(view.turn, card)
     }
     card.update(view.changes)
+    // Anchor the card directly under its turn's conclusion. When the recorded
+    // conclusion id no longer matches (a runtime upgrade can shift event seqs),
+    // fall back to the first message after this turn's own seq — never append
+    // to the tail, which would strand the card below later turns' messages.
     const conclusion = elements.messages.querySelector<HTMLElement>(`article.message[data-message-id="${cssEscape(view.conclusionId)}"]`)
     if (conclusion !== null && conclusion.nextElementSibling !== card.element) {
       conclusion.after(card.element)
-    } else if (conclusion === null) {
-      elements.messages.append(card.element)
+      continue
+    }
+    if (conclusion !== null) continue
+    const anchor = firstMessageAfterSeq(view.seq)
+    if (anchor === null) {
+      const lastAssistant = lastMessageElement()
+      if (lastAssistant !== null && lastAssistant.nextElementSibling !== card.element) {
+        lastAssistant.after(card.element)
+      } else if (lastAssistant === null && elements.messages.lastElementChild !== card.element) {
+        elements.messages.append(card.element)
+      }
+    } else if (anchor !== card.element && anchor.previousElementSibling !== card.element) {
+      elements.messages.insertBefore(card.element, anchor)
     }
   }
+}
+
+/** The first message element whose `event-<seq>` id is after the given seq. */
+function firstMessageAfterSeq(seq: number): HTMLElement | null {
+  if (!Number.isFinite(seq)) return null
+  for (const child of Array.from(elements.messages.children)) {
+    if (!(child instanceof HTMLElement) || child.classList.contains('turn-changes-card')) continue
+    const match = /^event-(\d+)$/u.exec(child.dataset.messageId ?? '')
+    if (match === null) continue
+    if (Number(match[1]) > seq) return child
+  }
+  return null
+}
+
+/** The last assistant message element in the transcript, or null. */
+function lastMessageElement(): HTMLElement | null {
+  for (let index = elements.messages.children.length - 1; index >= 0; index -= 1) {
+    const child = elements.messages.children[index]
+    if (child instanceof HTMLElement && child.classList.contains('message') && child.classList.contains('assistant')) return child
+  }
+  return null
 }
 
 export function messageText(item: ChatItem): string {

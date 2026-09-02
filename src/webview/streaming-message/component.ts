@@ -52,11 +52,24 @@ export class StreamingMessageComponent {
   patch(body: HTMLElement, item: StreamingMessage): boolean {
     const blocks = item.blocks ?? []
     const renderedBlocks = Array.from(body.children).filter((child) => !child.classList.contains('streaming-indicator'))
-    if (renderedBlocks.length !== blocks.length) return false
     const running = item.status === 'running'
+    // Streaming appends blocks (a new reasoning block starts, a text block
+    // follows a tool call). Growing is a normal patch, not a structure change:
+    // render the new blocks instead of bailing to a full re-render — a full
+    // re-render would rebuild every reasoning <details> closed and make the
+    // reader's expand snap shut in real time.
+    if (renderedBlocks.length < blocks.length) {
+      for (let index = renderedBlocks.length; index < blocks.length; index += 1) {
+        const block = blocks[index]
+        if (block !== undefined) body.insertBefore(this.renderBlock(block, index, running), body.querySelector('.streaming-indicator'))
+      }
+    } else if (renderedBlocks.length > blocks.length) {
+      return false
+    }
+    const settled = Array.from(body.children).filter((child) => !child.classList.contains('streaming-indicator'))
     for (let index = 0; index < blocks.length; index += 1) {
       const block = blocks[index]
-      const rendered = renderedBlocks[index]
+      const rendered = settled[index]
       if (block === undefined || !(rendered instanceof HTMLElement)) return false
       if (!this.patchBlock(rendered, block, running)) return false
     }

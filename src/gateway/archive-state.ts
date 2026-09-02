@@ -29,6 +29,10 @@ export interface ArchiveStateOptions {
   readonly createSession: () => Promise<string>
   /** The sessions considered visible (not archived, in-workspace), ordered. */
   readonly visibleSummaries: () => readonly SessionSummary[]
+  /** The currently selected session id, if any. */
+  readonly activeSessionId: () => string | undefined
+  /** Whether a session is effectively archived (set + no restore overlay). */
+  readonly isArchived: (sessionId: string) => boolean
   /** Notifies the host that the archive overlay changed. */
   readonly fireChange: () => void
 }
@@ -195,6 +199,12 @@ export class ArchiveState {
   }
 
   private sweepArchivedSelection(): void {
+    // A sweep exists to leave a selection that became archived. With nothing
+    // selected or the selection still visible, there is nothing to sweep —
+    // creating a fresh session here on an empty/fresh archive set would
+    // cascade into an unbounded run of blank sessions.
+    const active = this.options.activeSessionId()
+    if (active === undefined || !this.options.isArchived(active)) return
     void this.leaveArchivedSelection().catch((cause: unknown) => {
       this.options.output.appendLine(vscode.l10n.t('[gateway] Failed to leave the archived session: {0}', errorMessage(cause)))
     })

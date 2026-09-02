@@ -159,6 +159,8 @@ export class HarnessGatewayService implements vscode.Disposable {
       openSession: (sessionId) => this.openSession(sessionId),
       createSession: async () => this.createSession(),
       visibleSummaries: () => this.visibleSummaries(),
+      activeSessionId: () => this.activeSessionId,
+      isArchived: (sessionId) => this.archives.isArchived(sessionId),
       fireChange: () => this.fireChange(),
     })
     this.runtimeSubscription = runtime.onDidChangeState((state) => {
@@ -254,8 +256,11 @@ export class HarnessGatewayService implements vscode.Disposable {
 
   private async settleBaseline(): Promise<void> {
     const client = this.requireClient()
+    this.output.appendLine('[baseline] probe…')
     await client.probe()
+    this.output.appendLine('[baseline] probe ok, connect…')
     await this.connectionSettings.connect(client)
+    this.output.appendLine('[baseline] connect ok, streams…')
     this.startEventStreams()
     // The VSCode Memento can be rebuilt empty (state.vscdb), which wipes the
     // worktree registry. Recover records from disk mirrors BEFORE the first
@@ -264,22 +269,14 @@ export class HarnessGatewayService implements vscode.Disposable {
     // registry. Refreshing the list first would filter every isolated session
     // out (cwd ≠ workspace folder) and greet the user with an empty history.
     const workspaceRoots = (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath)
+    this.output.appendLine('[baseline] recover worktrees…')
     await this.worktrees.recover(workspaceRoots)
+    this.output.appendLine('[baseline] recover ok, refresh lists…')
     await Promise.all([this.refreshSessionList(), this.archives.refresh(), this.refreshPresets()])
+    this.output.appendLine('[baseline] lists ok, sweep…')
     // Sweep worktrees whose session no longer exists (crash between worktree
     // add and session create, or a session removed out-of-band).
     void this.cleanupOrphanWorktrees()
-    // Never-written blank drafts leftover from crashes/reinstalls are not
-    // history: archive every one of them so the history list starts clean
-    // (the session we are about to resume below may itself be blank, and that
-    // one is replaced the moment the user sends a message).
-    for (const summary of [...this.summaries.values()]) {
-      if (!summary.blank) continue
-      await this.archives.archive(String(summary.sessionId), (id) => this.summaries.has(id))
-        .catch((cause: unknown) => {
-          this.output.appendLine(vscode.l10n.t('[gateway] Failed to archive a leftover blank draft session: {0}', errorMessage(cause)))
-        })
-    }
     // Resume the user's last open session first; only fall back to the most
     // recent history entry, and only create a blank session when no history
     // exists at all. A reload/reinstall must never silently open a different
@@ -291,7 +288,9 @@ export class HarnessGatewayService implements vscode.Disposable {
       : this.visibleSummaries()[0]?.sessionId
     if (next !== undefined) {
       try {
+        this.output.appendLine(`[baseline] open session ${next}…`)
         await this.openSession(String(next))
+        this.output.appendLine(`[baseline] session ${next} opened`)
       } catch (cause) {
         // One damaged or legacy transcript must not take down the Gateway.
         // The user can still create a new session and inspect the log.
@@ -305,6 +304,26 @@ export class HarnessGatewayService implements vscode.Disposable {
         await this.createSession()
       } catch (cause) {
         this.output.appendLine(vscode.l10n.t('[gateway] Failed to open a fresh session: {0}', errorMessage(cause)))
+      }
+    }
+    // Never-written blank drafts leftover from crashes/reinstalls are not
+    // history: archive every one of them so the history list starts clean.
+    // This runs AFTER the resume above and SKIPS the resumed session: archiving
+    // an active/selected session triggers the leave-archived-selection path
+    // (openSession) which races the resume and times the baseline out.
+    // Guarded to real projects: a fresh project with no history (or no
+    // workspace folder at all) has nothing to sweep, and archiving in that
+    // state only risks the leave-archived-selection cascade.
+    const hasRealHistory = [...this.summaries.values()].some((summary) => !summary.blank
+      && this.inCurrentWorkspace(summary))
+    if (hasRealHistory) {
+      for (const summary of [...this.summaries.values()]) {
+        if (!summary.blank) continue
+        if (String(summary.sessionId) === this.activeSessionId) continue
+        await this.archives.archive(String(summary.sessionId), (id) => this.summaries.has(id))
+          .catch((cause: unknown) => {
+            this.output.appendLine(vscode.l10n.t('[gateway] Failed to archive a leftover blank draft session: {0}', errorMessage(cause)))
+          })
       }
     }
   }

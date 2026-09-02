@@ -342,6 +342,19 @@ export function workbenchHtml(webview: vscode.Webview, extensionUri: vscode.Uri)
     </figure>
   </div>
   <script nonce="${nonce}">globalThis.__DEEPSEEK_HARNESS_LOCALIZATION__=${localization};</script>
+  <script nonce="${nonce}">
+    // Surface webview-side failures to the host Output channel: a blank panel
+    // (e.g. a view restored into the editor area) is otherwise silent.
+    (function () {
+      try {
+        var post = function (message) {
+          try { acquireVsCodeApi().postMessage({ type: 'webviewError', message: String(message) }); } catch (e) { /* no host */ }
+        };
+        window.addEventListener('error', function (event) { post('error: ' + (event.message || 'unknown') + ' @ ' + (event.filename || '?') + ':' + String(event.lineno || 0)); });
+        window.addEventListener('unhandledrejection', function (event) { post('unhandledrejection: ' + String(event.reason)); });
+      } catch (e) { /* ignore */ }
+    }());
+  </script>
   <script nonce="${nonce}" src="${script}"></script>
 </body>
 </html>`

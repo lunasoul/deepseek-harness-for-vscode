@@ -5,11 +5,26 @@ import * as path from 'node:path'
 import * as vscode from 'vscode'
 import type { ConfigurationService, HarnessConfiguration } from '../config/configuration.js'
 import type { BundledRuntimeResolver } from './bundled-runtime.js'
+import { harnessHomePath } from './harness-home.js'
+import { isProjectionCacheFailure, recoverStaleProjectionCache } from './projection-cache-recovery.js'
 import { pruneShadowedRuntimePackages } from './profile-scope-prune.js'
 import { renderOverlay } from './runtime-overlay.js'
 
 const START_TIMEOUT_MS = 90_000
 const STOP_TIMEOUT_MS = 5_000
+
+/**
+ * Matches the Gateway's announced stdout line. The announced URL carries the
+ * process launch token as `?token=` — the client trades that token for the
+ * signed session cookie every /api call requires, so the query must survive
+ * parsing; dropping it leaves every call unauthenticated (HTTP 401).
+ */
+const GATEWAY_ANNOUNCE_PATTERN = /dsh gateway:\s+(http:\/\/127\.0\.0\.1:\d+(?:\/\?token=[A-Za-z0-9_-]+)?)/u
+
+/** Extracts the announced Gateway URL (launch token included) from one stdout line. */
+export function parseGatewayAnnouncement(line: string): string | undefined {
+  return GATEWAY_ANNOUNCE_PATTERN.exec(line)?.[1]
+}
 
 export type HostRuntimePhase = 'idle' | 'starting' | 'ready' | 'stopping' | 'error'
 
@@ -87,7 +102,7 @@ export class HarnessHostRuntime implements vscode.Disposable {
     configuration: HarnessConfiguration,
   ): Promise<string> {
     const launch = await this.resolver.resolve()
-    const home = path.join(this.context.globalStorageUri.fsPath, 'harness-home')
+    const home = harnessHomePath(this.context)
     const overlay = path.join(home, 'vscode.patch.yml')
     const gatewayPlugin = path.join(this.context.extensionUri.fsPath, 'dist', 'runtime', 'gateway-runtime.mjs')
     await mkdir(home, { recursive: true })
@@ -114,6 +129,44 @@ export class HarnessHostRuntime implements vscode.Disposable {
       { cwd: workspace, model: configuration.model, reasoning: configuration.reasoningEffort, preset: configuration.agentPreset },
     ))
 
+    // Boot with one self-heal retry: a dsh upgrade can leave a stale
+    // session-projection cache (session_projcache) whose records no longer
+    // match the new schema, crashing the gateway on boot in a loop. Detect the
+    // schema failure from stderr, back up + clear the cache, and retry once.
+    for (let attempt = 1; ; attempt += 1) {
+      const boot = await this.spawnGateway(launch, home, args, env)
+      if (boot.url !== undefined) return boot.url
+      if (boot.failure !== undefined) {
+        this.setState({ phase: 'error', error: boot.failure })
+        throw new Error(boot.failure)
+      }
+      if (attempt === 1
+        && (boot.exitCode ?? 0) !== 0
+        && isProjectionCacheFailure(boot.diagnostics ?? '')
+        && (await recoverStaleProjectionCache(home))) {
+        this.output.appendLine(vscode.l10n.t('[host] The Gateway crashed on a stale session-projection cache; the cache was backed up and the boot is retried once.'))
+        continue
+      }
+      const message = vscode.l10n.t('The bundled Harness runtime exited (code={code}, signal={signal}).', {
+        code: String(boot.exitCode),
+        signal: String(boot.signal ?? ''),
+      })
+      this.setState({ phase: 'error', error: message })
+      throw new Error(message)
+    }
+  }
+
+  /**
+   * Spawns the headless Gateway once and waits for its announced URL. Boot
+   * failures are returned (never thrown) so the caller can self-heal and
+   * retry; stderr is collected as diagnostics for failure classification.
+   */
+  private async spawnGateway(
+    launch: { readonly command: string; readonly args: readonly string[]; readonly environment: NodeJS.ProcessEnv },
+    home: string,
+    args: readonly string[],
+    env: NodeJS.ProcessEnv,
+  ): Promise<GatewayBoot> {
     // Spawn from the harness home, not the workspace: dsh boot reads
     // `cwd/.env` as the project layer and refuses bootstrap-only variables
     // (DEEPSEEK_BASE_URL, DSH_*, XDG_*, proxy vars, ...) declared there. A
@@ -123,23 +176,25 @@ export class HarnessHostRuntime implements vscode.Disposable {
     // and profile/config discovery, both of which live under DSH_HOME.
     const child = spawn(launch.command, args, { cwd: home, env, windowsHide: true })
     this.child = child
-    child.stderr.on('data', (chunk: Buffer | string) => this.output.append(String(chunk)))
+    let diagnostics = ''
+    child.stderr.on('data', (chunk: Buffer | string) => {
+      const text = String(chunk)
+      this.output.append(text)
+      diagnostics = (diagnostics + text).slice(-16_384)
+    })
 
-    return await new Promise<string>((resolve, reject) => {
+    return await new Promise<GatewayBoot>((resolve) => {
       let settled = false
       let buffer = ''
-      const timeout = setTimeout(() => finish(new Error(vscode.l10n.t('The bundled Harness runtime timed out while starting. Check the output logs.'))), START_TIMEOUT_MS)
+      const timeout = setTimeout(() => finish({
+        failure: vscode.l10n.t('The bundled Harness runtime timed out while starting. Check the output logs.'),
+      }), START_TIMEOUT_MS)
 
-      const finish = (result: string | Error): void => {
+      const finish = (boot: GatewayBoot): void => {
         if (settled) return
         settled = true
         clearTimeout(timeout)
-        if (typeof result === 'string') {
-          this.setState({ phase: 'ready', url: result })
-          resolve(result)
-        } else {
-          reject(result)
-        }
+        resolve(boot)
       }
 
       child.stdout.on('data', (chunk: Buffer | string) => {
@@ -149,21 +204,32 @@ export class HarnessHostRuntime implements vscode.Disposable {
         const lines = buffer.split(/\r?\n/u)
         buffer = lines.pop() ?? ''
         for (const line of lines) {
-          const match = /dsh gateway:\s+(http:\/\/127\.0\.0\.1:\d+)/u.exec(line)
-          if (match?.[1] !== undefined) finish(match[1])
+          if (line.includes('dsh gateway-auth-unavailable')) {
+            finish({ failure: vscode.l10n.t('The Gateway could not arm its authentication channel. Reload the workbench or reinstall the VSIX.') })
+            return
+          }
+          const url = parseGatewayAnnouncement(line)
+          if (url !== undefined) finish({ url })
         }
       })
-      child.once('error', (error) => finish(error))
+      child.once('error', (error) => finish({ failure: error.message, diagnostics }))
       child.once('exit', (code, signal) => {
         if (this.child === child) this.child = undefined
-        const message = vscode.l10n.t('The bundled Harness runtime exited (code={code}, signal={signal}).', {
-          code: String(code),
-          signal: String(signal),
-        })
-        if (!settled) finish(new Error(message))
-        else if (this.stateValue.phase !== 'stopping' && this.stateValue.phase !== 'idle') {
-          this.setState({ phase: 'error', error: message })
+        // The gateway may have announced readiness and then died later (a
+        // crash mid-session): surface that as a runtime error instead of a
+        // boot failure so the caller does not re-clear caches for an
+        // unrelated drop.
+        if (settled) {
+          if (this.stateValue.phase !== 'stopping' && this.stateValue.phase !== 'idle') {
+            const message = vscode.l10n.t('The bundled Harness runtime exited (code={code}, signal={signal}).', {
+              code: String(code),
+              signal: String(signal),
+            })
+            this.setState({ phase: 'error', error: message })
+          }
+          return
         }
+        finish({ exitCode: code, signal, diagnostics })
       })
     })
   }
@@ -223,4 +289,13 @@ function runtimeIdentity(
 ): string {
   const fingerprint = createHash('sha256').update(JSON.stringify(configuration)).digest('hex')
   return JSON.stringify({ workspace, fingerprint })
+}
+
+/** Outcome of one headless Gateway boot attempt. */
+interface GatewayBoot {
+  readonly url?: string
+  readonly failure?: string
+  readonly exitCode?: number | null
+  readonly signal?: NodeJS.Signals | null
+  readonly diagnostics?: string
 }

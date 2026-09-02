@@ -3,6 +3,7 @@ import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises'
 import * as path from 'node:path'
 import * as vscode from 'vscode'
 import type { BundledRuntimeResolver } from '../runtime/bundled-runtime.js'
+import { harnessHomePath } from '../runtime/harness-home.js'
 import { DEFAULT_BUILTIN_PLUGINS } from './default-plugins.js'
 import { isNpmPackageName, normalizePluginSpec } from './plugin-spec.js'
 import { RoutingSuiteInstaller } from './routing-suite/installer.js'
@@ -178,7 +179,7 @@ export class DshPluginManager {
   }
 
   private harnessHome(): string {
-    return path.join(this.context.globalStorageUri.fsPath, 'harness-home')
+    return harnessHomePath(this.context)
   }
 
   private profileDirectory(): string {
