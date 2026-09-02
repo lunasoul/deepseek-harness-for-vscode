@@ -6,7 +6,7 @@
  * and the connect-time healing passes in `./connection-settings/migrations.ts`;
  * this class only owns state and the lifecycle.
  */
-import type { SettingsNamespaceView, SettingsPathOpView } from '@deepseek-ai/dsh-host-apiproxy/api'
+import type { SettingsNamespaceView, SettingsPathOpView } from '@deepseek-ai/dsh-settings/types'
 import type { ConfigurationService } from '../config/configuration.js'
 import {
   DEEPSEEK_OFFICIAL_BASE_URL,
@@ -100,38 +100,37 @@ export class ConnectionSettingsService {
 
   async refresh(): Promise<ConnectionSettingsState> {
     const client = this.requireClient()
-    const [directoryResponse, settingsResponse, modelsResponse] = await Promise.all([
-      client.llm.providers({}),
-      client.settings.describe({}),
-      client.llm.models({}),
+    const [configurable, described, models, live] = await Promise.all([
+      client.llmListConfigurableProviders(),
+      client.settingsDescribe(),
+      client.sessionModelCatalog(),
+      client.llmListProviders(),
     ])
-    const directory = valueOf(directoryResponse)
-    const described = valueOf(settingsResponse)
-    const models = valueOf(modelsResponse)
+    const liveIds = new Set(live.map((provider) => provider.id))
     const namespaces = new Map(described.namespaces.map((namespace) => [namespace.ns, namespace]))
     // A custom relay is compatible when it exposes at least one model — its
     // ids need not be the built-in DeepSeek pair (e.g. Volcengine Ark model
     // ids or endpoint ids). The official route is always compatible.
     const groupsByProvider = new Map(models.groups.map((group) => [group.id, group]))
     const compatible = new Set<string>([DEEPSEEK_OFFICIAL_PROVIDER])
-    for (const entry of directory.providers) {
+    for (const entry of configurable) {
       if (entry.settingsNs !== DEEPSEEK_SETTINGS_NS && entry.settingsNs !== PI_AI_SETTINGS_NS) continue
       if (groupsByProvider.get(entry.provider)?.models.length) compatible.add(entry.provider)
     }
 
-    const entries = directory.providers.filter((entry) => (
+    const entries = configurable.filter((entry) => (
       compatible.has(entry.provider)
-      && (entry.provider === DEEPSEEK_OFFICIAL_PROVIDER || entry.active)
+      && (entry.provider === DEEPSEEK_OFFICIAL_PROVIDER || liveIds.has(entry.provider))
       && (entry.settingsNs === DEEPSEEK_SETTINGS_NS || entry.settingsNs === PI_AI_SETTINGS_NS)
     ))
-    const references = [...new Set(entries.map((entry) => credentialRef(entry, namespaces.get(entry.settingsNs))))]
-    const credentials = references.length === 0
-      ? { credentials: {} }
-      : valueOf(await client.credentials.describe({ refs: references }))
+    const references = [...new Set(entries.map((entry) => credentialRef(entry, namespaces.get(entry.settingsNs))))] as string[]
+    const credentials: Record<string, { readonly configured: boolean; readonly writable: boolean }> = references.length === 0
+      ? {}
+      : await client.credentialsDescribe(references)
     const providers = entries.map((entry) => providerView(
       entry,
       namespaces.get(entry.settingsNs),
-      credentials.credentials[credentialRef(entry, namespaces.get(entry.settingsNs))],
+      credentials[credentialRef(entry, namespaces.get(entry.settingsNs))],
     ))
     providers.sort((left, right) => {
       if (left.id === DEEPSEEK_OFFICIAL_PROVIDER) return -1
@@ -164,24 +163,19 @@ export class ConnectionSettingsService {
     const client = this.requireClient()
     const namespace = await this.namespace(PI_AI_SETTINGS_NS)
     const keyRef = providerKeyEnv(route)
-    const profile = deepSeekRelayProfile(normalized.name, normalized.baseUrl, keyRef, normalized.models)
+    const profile = deepSeekRelayProfile(normalized.name, normalized.baseUrl, keyRef, normalized.models) as unknown as import('@deepseek-ai/dsh-util-values').JsonValue
     const ops: SettingsPathOpView[] = existing === undefined
       ? [{ op: 'set', path: ['providers', route], value: profile }]
       : [
           { op: 'set', path: ['providers', route, 'displayName'], value: normalized.name },
           { op: 'set', path: ['providers', route, 'baseURL'], value: normalized.baseUrl },
           { op: 'set', path: ['providers', route, 'api'], value: 'openai-completions' },
-          { op: 'set', path: ['providers', route, 'compat'], value: relayCompat() },
-          { op: 'set', path: ['providers', route, 'models'], value: relayModels(normalized.models) },
+          { op: 'set', path: ['providers', route, 'compat'], value: relayCompat() as unknown as import('@deepseek-ai/dsh-util-values').JsonValue },
+          { op: 'set', path: ['providers', route, 'models'], value: relayModels(normalized.models) as unknown as import('@deepseek-ai/dsh-util-values').JsonValue },
           ...(normalized.apiKey === '' ? [] : [{ op: 'set' as const, path: ['providers', route, 'apiKeyEnv'], value: keyRef }]),
         ]
-    const response = await client.settings.mutate({
-      ns: PI_AI_SETTINGS_NS,
-      ops,
-      expectedRevision: namespace.revision,
-    })
-    valueOf(response)
-    if (normalized.apiKey !== '') valueOf(await client.credentials.set({ ref: keyRef, value: normalized.apiKey }))
+    await client.settingsMutate(PI_AI_SETTINGS_NS, ops as import('@deepseek-ai/dsh-settings/types').SettingsPathOpView[], namespace.revision)
+    if (normalized.apiKey !== '') await client.credentialsSet(keyRef, normalized.apiKey)
     await this.refresh()
     return route
   }
@@ -197,25 +191,21 @@ export class ConnectionSettingsService {
     // credential is still intact, so the user never loses a key for a provider
     // that still exists. A credential unset that fails afterwards leaves only
     // an invisible orphan key, which is safe.
-    valueOf(await client.settings.mutate({
-      ns: PI_AI_SETTINGS_NS,
-      ops: [{ op: 'unset', path: ['providers', provider] }],
-      expectedRevision: namespace.revision,
-    }))
-    const credential = valueOf(await client.credentials.describe({ refs: [ref] })).credentials[ref]
-    if (credential?.configured === true && credential.writable) valueOf(await client.credentials.unset({ ref }))
+    await client.settingsMutate(PI_AI_SETTINGS_NS, [{ op: 'unset', path: ['providers', provider] }], namespace.revision)
+    const credential = (await client.credentialsDescribe([ref]))[ref]
+    if (credential?.configured === true && credential.writable) await client.credentialsUnset(ref)
     await this.refresh()
   }
 
   async setOfficialApiKey(value: string): Promise<void> {
     const normalized = value.trim()
     if (normalized === '') throw new Error('The API Key cannot be empty.')
-    valueOf(await this.requireClient().credentials.set({ ref: 'DEEPSEEK_API_KEY', value: normalized }))
+    await this.requireClient().credentialsSet('DEEPSEEK_API_KEY', normalized)
     await this.refresh()
   }
 
   async clearOfficialApiKey(): Promise<void> {
-    valueOf(await this.requireClient().credentials.unset({ ref: 'DEEPSEEK_API_KEY' }))
+    await this.requireClient().credentialsUnset('DEEPSEEK_API_KEY')
     await this.refresh()
   }
 
@@ -229,16 +219,12 @@ export class ConnectionSettingsService {
     const ops: SettingsPathOpView[] = normalizedBase === ''
       ? [{ op: 'unset', path: ['baseURL'] }]
       : [{ op: 'set', path: ['baseURL'], value: normalizedBase }]
-    valueOf(await client.settings.mutate({
-      ns: DEEPSEEK_SETTINGS_NS,
-      ops,
-      expectedRevision: namespace.revision,
-    }))
-    if (apiKey !== '') valueOf(await client.credentials.set({ ref: 'DEEPSEEK_API_KEY', value: apiKey }))
+    await client.settingsMutate(DEEPSEEK_SETTINGS_NS, ops, namespace.revision)
+    if (apiKey !== '') await client.credentialsSet('DEEPSEEK_API_KEY', apiKey)
   }
 
   private async namespace(ns: string): Promise<SettingsNamespaceView> {
-    const described = valueOf(await this.requireClient().settings.describe({}))
+    const described = await this.requireClient().settingsDescribe()
     const namespace = described.namespaces.find((item) => item.ns === ns)
     if (namespace === undefined) throw new Error(`Harness settings namespace "${ns}" is unavailable.`)
     if (!described.writable) throw new Error('Harness settings are read-only.')

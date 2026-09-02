@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import type { HistoryEntry } from '@deepseek-ai/dsh-host-apiproxy/api'
+import type { HistoryEntry } from '../src/gateway/gateway-wire.js'
 import { projectSessionStats, projectionSessionStats } from '../src/domain/session-stats.js'
 
 function entry(seq: number, time: number, event: HistoryEntry['event']): HistoryEntry {

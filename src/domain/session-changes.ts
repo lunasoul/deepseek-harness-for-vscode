@@ -1,4 +1,4 @@
-import type { HistoryEntry } from '@deepseek-ai/dsh-host-apiproxy/api'
+import type { HistoryEntry } from '../gateway/gateway-wire.js'
 
 export interface SessionFileChangeView {
   readonly path: string

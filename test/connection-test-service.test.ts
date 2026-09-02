@@ -3,11 +3,8 @@ import { ConnectionTestService } from '../src/services/connection-test-service.j
 
 describe('ConnectionTestService', () => {
   it('uses upstream model discovery and allows it to resolve the stored key', async () => {
-    const discoverModels = vi.fn(async () => ({
-      rpcId: 'test',
-      result: { ok: true as const, value: { models: [{ id: 'deepseek-v4-pro' }] } },
-    }))
-    const service = new ConnectionTestService(() => ({ llm: { discoverModels } } as never))
+    const discoverModels = vi.fn(async () => [{ id: 'deepseek-v4-pro' }])
+    const service = new ConnectionTestService(() => ({ llmDiscoverModels: discoverModels } as never))
 
     await expect(service.test({
       provider: 'packycode',
@@ -16,8 +13,7 @@ describe('ConnectionTestService', () => {
       apiKey: '',
       models: [],
     })).resolves.toEqual({ status: 'success', modelCount: 1, models: [{ id: 'deepseek-v4-pro' }] })
-    expect(discoverModels).toHaveBeenCalledWith({
-      settingsNs: 'llm-pi-ai',
+    expect(discoverModels).toHaveBeenCalledWith('llm-pi-ai', {
       provider: 'packycode',
       baseURL: 'https://relay.example/v1',
       api: 'openai-completions',
@@ -26,11 +22,8 @@ describe('ConnectionTestService', () => {
 
   it('reports every upstream discovery failure as a failure', async () => {
     const service = new ConnectionTestService(() => ({
-      llm: {
-        discoverModels: async () => ({
-          rpcId: 'test',
-          result: { ok: false as const, error: { code: 'model-discovery-failed', message: '/models answered 500' } },
-        }),
+      llmDiscoverModels: async () => {
+        throw new Error('/models answered 500')
       },
     } as never))
 

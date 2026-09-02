@@ -6,13 +6,13 @@
  * so a failed write can never leave a ghost state the UI echoes as durable.
  */
 import * as vscode from 'vscode'
-import type { HistoryEntry } from '@deepseek-ai/dsh-client-connection/client'
+import type { HistoryEntry } from './gateway-wire.js'
 import type { EffortIntent } from '../domain/session-effort.js'
 import { readSessionMeta, type SessionMeta } from '../domain/session-meta.js'
 import { metaSortRank } from '../domain/session-meta.js'
 import { projectSessionChanges, type SessionChangesView } from '../domain/session-changes.js'
 import type { TurnChangesView } from '../domain/workbench-state.js'
-import { lastAssistantSeq } from './gateway-helpers.js'
+import { lastAssistantSeqForTurn, lastAssistantSeq } from './gateway-helpers.js'
 
 const EFFORT_INTENT_STATE_KEY = 'deepseekHarness.sessionEffortIntents'
 const SESSION_META_STATE_KEY = 'deepseekHarness.sessionMeta'
@@ -126,7 +126,10 @@ export class SessionMetaStore {
     if (turn === undefined) return
     const changes = projectSessionChanges(entries)
     if (changes === undefined || changes.files.length === 0) return
-    const conclusionSeq = lastAssistantSeq(entries)
+    // Prefer the turn-scoped conclusion: the recorded card must anchor to this
+    // turn's own last assistant message, never a later turn's (streamed
+    // history or a runtime upgrade can shift the transcript tail).
+    const conclusionSeq = lastAssistantSeqForTurn(entries, turn) ?? lastAssistantSeq(entries)
     if (conclusionSeq === undefined) return
     const existing = this.turnChangesBySession.get(sessionId) ?? []
     const next = existing.filter((candidate) => candidate.turn !== turn)

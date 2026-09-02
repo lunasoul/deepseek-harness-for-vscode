@@ -6,7 +6,7 @@
  * partial overlay on disk.
  */
 import * as vscode from 'vscode'
-import type { SessionSummary } from '@deepseek-ai/dsh-client-connection/client'
+import type { SessionSummary } from './gateway-wire.js'
 import {
   RESTORED_ARCHIVE_STATE_KEY,
   isEffectivelyArchived,

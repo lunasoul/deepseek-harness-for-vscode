@@ -1,12 +1,12 @@
 import * as vscode from 'vscode'
 import type {
+  ControlFrame,
+  FollowFrame,
   HistoryEntry,
-  HostFrame,
-  IApiClient,
   JobView,
   MessageId,
-  MuxFrame,
   QueuedInboxItem,
+  RemoteEvent,
   RpcId,
   SessionId,
   SessionModels,
@@ -14,9 +14,9 @@ import type {
   SkillEntry,
   SubagentAddress,
   SubagentListEntry,
-} from '@deepseek-ai/dsh-client-connection/client'
-import type { PromptContentPart } from '@deepseek-ai/dsh-host-apiproxy/api'
-import type { AgentPresetEntry } from '@deepseek-ai/dsh-host-apiproxy/api'
+} from './gateway-wire.js'
+import type { PromptContentPart } from './gateway-wire.js'
+import type { AgentPresetRow as AgentPresetEntry, AgentPresetRoster } from '@deepseek-ai/dsh-agent-presets/types'
 import type { ConfigurationService } from '../config/configuration.js'
 import { buildCarryOverMessage, type CarryTurn } from '../domain/carry-over.js'
 import { projectionContextPressure } from '../domain/context-pressure.js'
@@ -58,9 +58,6 @@ import {
   newSessionId,
   queuedPromptView,
   recordValue,
-  respondMessage,
-  stripApprovalTransport,
-  stripQuestionTransport,
   subagentView,
   valueOf,
 } from './gateway-helpers.js'
@@ -69,12 +66,14 @@ import { PendingConfigurationQueue, type PendingConfigEntry } from './pending-qu
 import { SessionMetaStore } from './session-meta-store.js'
 
 interface PendingApprovalRecord extends PendingApprovalView {
-  readonly rpcId: RpcId
+  readonly clientId: string
+  readonly eventId: string
   readonly approvalId: string
 }
 
 interface PendingQuestionRecord extends PendingQuestionView {
-  readonly rpcId: RpcId
+  readonly clientId: string
+  readonly eventId: string
 }
 
 
@@ -86,8 +85,17 @@ interface PendingQuestionRecord extends PendingQuestionView {
 export class HarnessGatewayService implements vscode.Disposable {
   private readonly changeEmitter = new vscode.EventEmitter<void>()
   private readonly runtimeSubscription: vscode.Disposable
-  private client: IApiClient | undefined
+  private client: NodeGatewayClient | undefined
   private streamAbort: AbortController | undefined
+  private followAbort: AbortController | undefined
+  /** Per-session follow cursor (the snapshot `cursor` handed to session/page). */
+  private readonly followCursor = new Map<string, number>()
+  /** The $events client id of the current remote-event generation. */
+  private remoteEventClientId: string | undefined
+  /** Latest archived-session snapshot from `workspace/follow`, if seen. */
+  private archivedFromHost: readonly string[] | undefined
+  /** Setters waiting for the current follow snapshot (keyed by session id). */
+  private readonly followSnapshotWaiters = new Map<string, (value: void) => void>()
   private summaries = new Map<string, SessionSummary>()
   private entries: HistoryEntry[] = []
   private hasMore = false
@@ -100,7 +108,7 @@ export class HarnessGatewayService implements vscode.Disposable {
   private approvals = new Map<string, PendingApprovalRecord>()
   private questions = new Map<string, PendingQuestionRecord>()
   private subagentCount = 0
-  private subagents: SubagentListEntry[] = []
+  private subagents: readonly SubagentListEntry[] = []
   private subagentAddress: SubagentAddress | undefined
   private projections: Record<string, unknown> = {}
   /** Armed by a mode switch; consumed by the next prompt in its target session. */
@@ -144,8 +152,8 @@ export class HarnessGatewayService implements vscode.Disposable {
     this.archives = new ArchiveState({
       globalState: this.globalState,
       output: this.output,
-      listArchived: async () => valueOf(await this.requireClient().workspace.list({})).archivedSessionIds,
-      archiveSession: async (sessionId) => valueOf(await this.requireClient().workspace.archiveSession({
+      listArchived: async () => [...(this.archivedFromHost ?? [])],
+      archiveSession: async (sessionId) => (await this.requireClient().workspaceArchiveSession({
         sessionId: sessionId as SessionId,
       })).archivedSessionIds.map(String),
       openSession: (sessionId) => this.openSession(sessionId),
@@ -190,23 +198,8 @@ export class HarnessGatewayService implements vscode.Disposable {
     this.phase = 'starting'
     this.error = undefined
     this.fireChange()
-    // Startup watchdog: the gateway process may come up while one of the
-    // baseline RPCs (host.describe, provider/settings/models describe,
-    // session list) hangs forever — e.g. a misconfigured custom provider whose
-    // settings namespace refuses to answer. Without a deadline the workbench
-    // would sit on the "Starting Harness" screen indefinitely. Race the whole
-    // boot against a timer; on expiry, surface a clear error instead.
-    const watchdog = new Promise<never>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        reject(new Error(vscode.l10n.t(
-          'The bundled Harness runtime started but the Gateway baseline did not settle within {0}s. Check the output logs and your provider configuration.',
-          String(START_BASELINE_TIMEOUT_S),
-        )))
-      }, START_BASELINE_TIMEOUT_S * 1_000)
-      timer.unref?.()
-    })
     try {
-      await Promise.race([this.runStartBaseline(), watchdog])
+      await this.runStartBaseline()
       this.phase = 'connected'
     } catch (cause) {
       this.phase = 'error'
@@ -216,55 +209,103 @@ export class HarnessGatewayService implements vscode.Disposable {
     this.fireChange()
   }
 
+  /** Construction seam so start-flow tests can substitute a stub client. */
+  protected createGatewayClient(url: string): NodeGatewayClient {
+    return new NodeGatewayClient(url)
+  }
+
   private async runStartBaseline(): Promise<void> {
     try {
+      // Process boot has its own (longer) start timeout in the runtime: a
+      // slow first boot after an extension update must not consume the
+      // baseline budget below.
       const url = await this.runtime.start()
-      this.client = new NodeGatewayClient(url)
-      valueOf(await this.client.host.describe({}))
-      await this.connectionSettings.connect(this.client)
-      this.startEventStreams()
-      // The VSCode Memento can be rebuilt empty (state.vscdb), which wipes the
-      // worktree registry. Recover records from disk mirrors BEFORE the first
-      // session list is rendered: an isolated session's recorded cwd is its
-      // worktree path, and scoping maps it back to the repo root through this
-      // registry. Refreshing the list first would filter every isolated session
-      // out (cwd ≠ workspace folder) and greet the user with an empty history.
-      const workspaceRoots = (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath)
-      await this.worktrees.recover(workspaceRoots)
-      await Promise.all([this.refreshSessionList(), this.archives.refresh(), this.refreshPresets()])
-      // Sweep worktrees whose session no longer exists (crash between worktree
-      // add and session create, or a session removed out-of-band).
-      void this.cleanupOrphanWorktrees()
-      const requested = this.activeSessionId
-      const next = requested !== undefined && this.summaries.has(requested) && !this.archives.isArchived(requested)
-        ? requested
-        : this.visibleSummaries()[0]?.sessionId
-      if (next !== undefined) {
-        try {
-          await this.openSession(String(next))
-        } catch (cause) {
-          // One damaged or legacy transcript must not take down the Gateway.
-          // The user can still create a new session and inspect the log.
-          this.output.appendLine(vscode.l10n.t('[gateway] Failed to load recent sessions: {0}', errorMessage(cause)))
-        }
-      } else {
-        // No session to resume: open a fresh blank one so the model and
-        // permission selectors are usable before the first message is sent.
-        // Blank sessions are archivable and never pollute the history.
-        try {
-          await this.createSession()
-        } catch (cause) {
-          this.output.appendLine(vscode.l10n.t('[gateway] Failed to open a fresh session: {0}', errorMessage(cause)))
-        }
-      }
+      this.client = this.createGatewayClient(url)
+      // Baseline watchdog: the gateway process is up, but one of the
+      // post-boot RPCs (probe, provider/settings/models describe, session
+      // list) may still hang forever — e.g. a misconfigured custom provider
+      // whose settings namespace refuses to answer. Without a deadline the
+      // workbench would sit on the "Starting Harness" screen indefinitely.
+      // The race lives INSIDE this try so expiry tears the runtime down
+      // instead of leaking the half-started gateway process.
+      const watchdog = new Promise<never>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          reject(new Error(vscode.l10n.t(
+            'The bundled Harness runtime started but the Gateway baseline did not settle within {0}s. Check the output logs and your provider configuration. Another running `dsh web` instance can lock the profile and block this gateway — exit it and retry.',
+            String(START_BASELINE_TIMEOUT_S),
+          )))
+        }, START_BASELINE_TIMEOUT_S * 1_000)
+        timer.unref?.()
+      })
+      await Promise.race([this.settleBaseline(), watchdog])
     } catch (cause) {
       // A failed baseline must still tear down the half-started runtime so a
-      // retry starts from a clean slate.
+      // retry starts from a clean slate. Disconnect first: the orphaned
+      // settleBaseline promise keeps running inside the race, and its client/
+      // streams must not survive into the next start().
       this.phase = 'error'
       this.error = errorMessage(cause)
       this.output.appendLine(`[gateway] ${this.error}`)
+      this.disconnect()
       await this.runtime.stop().catch(() => undefined)
       throw cause
+    }
+  }
+
+  private async settleBaseline(): Promise<void> {
+    const client = this.requireClient()
+    await client.probe()
+    await this.connectionSettings.connect(client)
+    this.startEventStreams()
+    // The VSCode Memento can be rebuilt empty (state.vscdb), which wipes the
+    // worktree registry. Recover records from disk mirrors BEFORE the first
+    // session list is rendered: an isolated session's recorded cwd is its
+    // worktree path, and scoping maps it back to the repo root through this
+    // registry. Refreshing the list first would filter every isolated session
+    // out (cwd ≠ workspace folder) and greet the user with an empty history.
+    const workspaceRoots = (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath)
+    await this.worktrees.recover(workspaceRoots)
+    await Promise.all([this.refreshSessionList(), this.archives.refresh(), this.refreshPresets()])
+    // Sweep worktrees whose session no longer exists (crash between worktree
+    // add and session create, or a session removed out-of-band).
+    void this.cleanupOrphanWorktrees()
+    // Never-written blank drafts leftover from crashes/reinstalls are not
+    // history: archive every one of them so the history list starts clean
+    // (the session we are about to resume below may itself be blank, and that
+    // one is replaced the moment the user sends a message).
+    for (const summary of [...this.summaries.values()]) {
+      if (!summary.blank) continue
+      await this.archives.archive(String(summary.sessionId), (id) => this.summaries.has(id))
+        .catch((cause: unknown) => {
+          this.output.appendLine(vscode.l10n.t('[gateway] Failed to archive a leftover blank draft session: {0}', errorMessage(cause)))
+        })
+    }
+    // Resume the user's last open session first; only fall back to the most
+    // recent history entry, and only create a blank session when no history
+    // exists at all. A reload/reinstall must never silently open a different
+    // conversation than the one the user was working in.
+    const requested = this.activeSessionId
+      ?? this.globalState.get<string>(LAST_SESSION_STATE_KEY)
+    const next = requested !== undefined && this.summaries.has(requested) && !this.archives.isArchived(requested)
+      ? requested
+      : this.visibleSummaries()[0]?.sessionId
+    if (next !== undefined) {
+      try {
+        await this.openSession(String(next))
+      } catch (cause) {
+        // One damaged or legacy transcript must not take down the Gateway.
+        // The user can still create a new session and inspect the log.
+        this.output.appendLine(vscode.l10n.t('[gateway] Failed to load recent sessions: {0}', errorMessage(cause)))
+      }
+    } else {
+      // No session to resume: open a fresh blank one so the model and
+      // permission selectors are usable before the first message is sent.
+      // Blank sessions are archivable and never pollute the history.
+      try {
+        await this.createSession()
+      } catch (cause) {
+        this.output.appendLine(vscode.l10n.t('[gateway] Failed to open a fresh session: {0}', errorMessage(cause)))
+      }
     }
   }
 
@@ -327,8 +368,8 @@ export class HarnessGatewayService implements vscode.Disposable {
       skills: this.skills,
       jobs: this.jobs,
       queue: this.queue.map(queuedPromptView),
-      approvals: [...this.approvals.values()].map(stripApprovalTransport),
-      questions: [...this.questions.values()].map(stripQuestionTransport),
+      approvals: [...this.approvals.values()].map((pending) => ({ key: pending.key, toolName: pending.toolName, ...(pending.reason === undefined ? {} : { reason: pending.reason }) })),
+      questions: [...this.questions.values()].map((pending) => ({ key: pending.key, questions: pending.questions })),
       subagentCount: this.subagentCount,
       subagents: this.subagents.map(subagentView),
       ...(this.subagentAddress === undefined ? {} : {
@@ -372,7 +413,8 @@ export class HarnessGatewayService implements vscode.Disposable {
   /** Refreshes the active session's model catalog after a live provider edit. */
   async refreshModelCatalog(): Promise<void> {
     if (this.activeSessionId === undefined) return
-    this.models = valueOf(await this.requireClient().sessions.models({ sessionId: this.activeSessionId as SessionId }))
+    const catalog = await this.requireClient().sessionModelCatalog()
+    this.models = { ...catalog, current: catalog.default }
     this.fireChange()
   }
 
@@ -389,7 +431,7 @@ export class HarnessGatewayService implements vscode.Disposable {
     const prepared = await this.worktrees.prepare(sessionId, baseCwd)
     let created
     try {
-      created = valueOf(await client.sessions.create({ cwd: prepared.cwd, sessionId: sessionId as SessionId, agentPreset: selectedPreset }))
+      created = await client.sessionCreate({ cwd: prepared.cwd, sessionId: sessionId as SessionId, agentPreset: selectedPreset })
     } catch (cause) {
       // Roll back the freshly created worktree so a failed create cannot leak it.
       if (prepared.isolated) await this.worktrees.discard(sessionId).catch(() => undefined)
@@ -574,7 +616,7 @@ export class HarnessGatewayService implements vscode.Disposable {
   async searchSessions(query: string): Promise<{ readonly sessionId: string; readonly snippet: string }[]> {
     const normalized = query.trim()
     if (normalized === '') return []
-    const result = valueOf(await this.requireClient().sessions.search({ query: normalized }))
+    const result = await this.requireClient().sessionSearch({ query: normalized })
     return result.items
       .filter((item) => {
         const summary = this.summaries.get(String(item.sessionId))
@@ -586,8 +628,30 @@ export class HarnessGatewayService implements vscode.Disposable {
   async selectSession(sessionId: string): Promise<void> {
     if (!this.summaries.has(sessionId)) await this.refreshSessionList()
     if (!this.summaries.has(sessionId)) throw new Error(vscode.l10n.t('Session not found.'))
+    // Remember the selection so a reload/reinstall resumes this conversation
+    // instead of silently opening a different (or blank) session.
+    await this.globalState.update(LAST_SESSION_STATE_KEY, sessionId).then(
+      () => undefined,
+      () => undefined,
+    )
+    // A never-written blank draft is not history: when the user switches away,
+    // archive it so the draft does not accumulate in the history list.
+    const leaving = this.activeSessionId
+    if (leaving !== undefined && leaving !== sessionId) {
+      const leavingSummary = this.summaries.get(leaving)
+      if (leavingSummary?.blank === true) {
+        await this.archives.archive(leaving, (id) => this.summaries.has(id)).catch((cause: unknown) => {
+          this.output.appendLine(vscode.l10n.t('[gateway] Failed to archive a blank draft session: {0}', errorMessage(cause)))
+        })
+      }
+    }
     const generation = ++this.selectionGeneration
     this.activeSessionId = sessionId
+    // Force the follow pump to open a fresh snapshot for the new selection:
+    // without this, switching away and back leaves the pump on the old
+    // session's live stream (which never re-sends its snapshot), so the
+    // conversation renders empty.
+    this.followAbort?.abort()
     this.subagentAddress = undefined
     this.entries = []
     this.hasMore = false
@@ -607,23 +671,20 @@ export class HarnessGatewayService implements vscode.Disposable {
     const id = sessionId as SessionId
 
     // History is persistence-backed and can be rendered without a live Agent.
-    // Load it first so a cold session is useful even if its preset can no
-    // longer be resumed. Mux events received during the read are merged in.
-    const historyValue = valueOf(await client.sessions.history({ sessionId: id, maxMessages: 80 }))
+    // The follow stream delivers the snapshot window plus subsequent events
+    // (this service owns it only after startEventStreams ran); wait for the
+    // snapshot batch so a cold session is useful even if its preset can no
+    // longer be resumed.
+    if (this.streamAbort !== undefined) await this.waitForFollowSnapshot(sessionId)
     if (!this.isCurrentSelection(sessionId, generation)) return
-    this.entries = mergeHistory(historyValue.events, this.entries)
-    this.hasMore = historyValue.hasMore
-    this.projections = recordValue(historyValue.projections?.values)
-    this.applyTitleProjection(sessionId, projectionTitle(historyValue.projections?.values))
-    this.fireChange()
 
-    // session.models owns the official cold-session resume path. It must
-    // settle before skills.list: the latter intentionally never attaches an
+    // session/modelCatalog owns the official cold-session resume path. It must
+    // settle before skills/list: the latter intentionally never attaches an
     // Agent and otherwise races into "not found (not attached)" on startup.
     try {
-      const models = valueOf(await client.sessions.models({ sessionId: id }))
+      const models = await client.sessionModelCatalog()
       if (!this.isCurrentSelection(sessionId, generation)) return
-      this.models = models
+      this.models = { ...models, current: models.default }
       this.fireChange()
     } catch (cause) {
       this.output.appendLine(vscode.l10n.t('[gateway] Failed to load the model catalog for session {0}: {1}', sessionId, errorMessage(cause)))
@@ -633,15 +694,15 @@ export class HarnessGatewayService implements vscode.Disposable {
     // These catalogs are independent after resume. A missing optional plugin
     // degrades only its panel instead of failing the entire workbench.
     const [skills, subagents, commands] = await Promise.allSettled([
-      client.skills.list({ sessionId: id }),
-      client.subagents.list({ parentSessionId: id }),
+      client.skillList({ sessionId: id }),
+      client.subagentList(id),
       this.commandsFor(sessionId),
     ])
     if (!this.isCurrentSelection(sessionId, generation)) return
-    if (skills.status === 'fulfilled') this.skills = valueOf(skills.value).skills
+    if (skills.status === 'fulfilled') this.skills = skills.value.skills
     else this.logOptionalCatalogFailure('Skills', skills.reason)
     if (subagents.status === 'fulfilled') {
-      this.subagents = valueOf(subagents.value).entries
+      this.subagents = subagents.value.entries
       this.subagentCount = this.subagents.length
     } else this.logOptionalCatalogFailure(vscode.l10n.t('sub-agent'), subagents.reason)
     if (commands.status === 'fulfilled') this.commands = commands.value
@@ -670,19 +731,18 @@ export class HarnessGatewayService implements vscode.Disposable {
     const sessionId = this.requireActiveSession()
     const beforeSeq = this.entries[0]?.event.seq
     if (beforeSeq === undefined || !this.hasMore) return
-    const page = this.subagentAddress === undefined
-      ? valueOf(await this.requireClient().sessions.history({
-        sessionId: sessionId as SessionId,
-        beforeSeq,
-        maxMessages: 60,
-      }))
-      : valueOf(await this.requireClient().subagents.history({
-        ...this.subagentAddress,
-        beforeSeq,
-        maxMessages: 60,
-      }))
+    const address = this.activeFollowAddress()
+    if (address === undefined) return
+    const cursor = this.followCursor.get(sessionId)
+    const page = await this.requireClient().sessionPage({
+      address,
+      throughSeq: cursor ?? 0,
+      ...(beforeSeq === undefined ? {} : { beforeSeq }),
+      maxMessages: 60,
+    })
+    const records = NodeGatewayClient.expandRecords(page.records as unknown[]) as HistoryEntry[]
     const existing = new Set(this.entries.map((entry) => entry.event.seq))
-    this.entries = [...page.events.filter((entry) => !existing.has(entry.event.seq)), ...this.entries]
+    this.entries = [...records.filter((entry) => !existing.has(entry.event.seq)), ...this.entries]
     this.hasMore = page.hasMore
     this.fireChange()
   }
@@ -800,22 +860,26 @@ export class HarnessGatewayService implements vscode.Disposable {
     ]
     try {
       if (this.subagentAddress === undefined) {
-        valueOf(await this.requireClient().sessions.prompt({
+        await this.requireClient().sessionPrompt({
+          requestId: newPromptRequestId(),
           sessionId: target as SessionId,
           mode,
           content,
           clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-        }))
+        })
       } else {
         if (this.subagentAddress.mode === 'one-shot') throw new Error(vscode.l10n.t('One-shot sub-agent history is read-only.'))
         if (content.some((part) => part.type === 'image')) {
           throw new Error(vscode.l10n.t('Image attachments are not supported in sub-agent conversations.'))
         }
-        valueOf(await this.requireClient().subagents.prompt({
-          ...this.subagentAddress,
+        await this.requireClient().subagentPrompt({
+          requestId: newPromptRequestId(),
+          parentSessionId: this.subagentAddress.parentSessionId,
+          childSessionId: this.subagentAddress.childSessionId,
+          mode: 'continuable',
           content: content.flatMap((part) => part.type === 'text' ? [{ type: 'text' as const, text: part.text }] : []),
           clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-        }))
+        })
       }
       if (ordinarySession) this.clearCarryOver(target)
     } catch (cause) {
@@ -848,50 +912,59 @@ export class HarnessGatewayService implements vscode.Disposable {
   async steerQueued(itemId: string): Promise<void> {
     const sessionId = this.requireActiveSession()
     const client = this.requireClient()
-    const response = await client.sessions.updateQueue({
-      sessionId: sessionId as SessionId,
-      itemId: itemId as MessageId,
-      action: { kind: 'steer' },
-    })
-    if (response.result.ok) return
-    if (response.result.error.code === 'queue-item-not-found') return
-    if (response.result.error.code !== 'steer-unavailable') {
-      throw new Error(response.result.error.message)
+    let response: { readonly code?: string; readonly message?: string }
+    try {
+      await client.sessionUpdateQueue({ sessionId: sessionId as SessionId, itemId: itemId as MessageId, action: { kind: 'steer' } })
+      return
+    } catch (cause) {
+      response = codeOf(cause)
+      if (response.code === 'queue-item-not-found') return
+      if (response.code !== 'steer-unavailable') throw new Error(response.message ?? String(cause))
     }
     const item = this.queue.find((candidate) => candidate.id === itemId)
-    if (item === undefined || item.message.content.some((block) => block.type === 'image')) {
-      throw new Error(response.result.error.message)
+    if (item === undefined || item.message.content.some((block) => (block as { readonly type?: string }).type === 'image')) {
+      throw new Error(response.message ?? vscode.l10n.t('This queued prompt is no longer steerable.'))
     }
     const text = item.message.content
-      .filter((block): block is { readonly type: 'text'; readonly text: string } => block.type === 'text')
+      .filter((block): block is { readonly type: 'text'; readonly text: string } => (block as { readonly type?: string }).type === 'text')
       .map((block) => block.text)
       .join('\n')
-    if (text.trim() === '') throw new Error(response.result.error.message)
-    const removed = await client.sessions.updateQueue({
-      sessionId: sessionId as SessionId,
-      itemId: itemId as MessageId,
-      action: { kind: 'remove' },
-    })
-    if (!removed.result.ok) throw new Error(removed.result.error.message)
-    const prompt = {
-      sessionId: sessionId as SessionId,
-      content: [{ type: 'text' as const, text }],
-      clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    if (text.trim() === '') throw new Error(response.message ?? vscode.l10n.t('This queued prompt is no longer steerable.'))
+    try {
+      await client.sessionUpdateQueue({ sessionId: sessionId as SessionId, itemId: itemId as MessageId, action: { kind: 'remove' } })
+    } catch (cause) {
+      throw new Error(cause instanceof Error ? cause.message : String(cause))
     }
-    const steered = await client.sessions.prompt({ ...prompt, mode: 'steer' })
-    if (steered.result.ok) return
-    const queued = await client.sessions.prompt({ ...prompt, mode: 'queue' })
-    if (!queued.result.ok) throw new Error(queued.result.error.message)
+    const textContent = [{ type: 'text' as const, text }]
+    try {
+      await client.sessionPrompt({
+        requestId: newPromptRequestId(),
+        sessionId: sessionId as SessionId,
+        mode: 'steer',
+        content: textContent,
+        clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      })
+      return
+    } catch {
+      // The running turn ended; the text goes out as a normal queued prompt.
+    }
+    try {
+      await client.sessionPrompt({
+        requestId: newPromptRequestId(),
+        sessionId: sessionId as SessionId,
+        mode: 'queue',
+        content: textContent,
+        clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      })
+    } catch (cause) {
+      throw new Error(cause instanceof Error ? cause.message : String(cause))
+    }
   }
 
   /** Withdraws one still-pending queued prompt before the agent claims it. */
   async removeQueued(itemId: string): Promise<void> {
     const sessionId = this.requireActiveSession()
-    valueOf(await this.requireClient().sessions.updateQueue({
-      sessionId: sessionId as SessionId,
-      itemId: itemId as MessageId,
-      action: { kind: 'remove' },
-    }))
+    await this.requireClient().sessionUpdateQueue({ sessionId: sessionId as SessionId, itemId: itemId as MessageId, action: { kind: 'remove' } })
     // Removing an item breaks the FIFO alignment between the runtime queue
     // and the pending configurations; drop them instead of applying a stale
     // configuration to the wrong prompt.
@@ -901,11 +974,7 @@ export class HarnessGatewayService implements vscode.Disposable {
   /** Rewrites the text of one still-pending queued prompt. */
   async editQueued(itemId: string, text: string): Promise<void> {
     const sessionId = this.requireActiveSession()
-    valueOf(await this.requireClient().sessions.updateQueue({
-      sessionId: sessionId as SessionId,
-      itemId: itemId as MessageId,
-      action: { kind: 'edit', content: [{ type: 'text', text }] },
-    }))
+    await this.requireClient().sessionUpdateQueue({ sessionId: sessionId as SessionId, itemId: itemId as MessageId, action: { kind: 'edit', content: [{ type: 'text', text }] } })
     // Same alignment concern as removeQueued: an edited item still occupies
     // its queue slot, but its original configuration intent is no longer
     // reliably attached to it.
@@ -915,9 +984,9 @@ export class HarnessGatewayService implements vscode.Disposable {
   async cancel(): Promise<void> {
     const sessionId = this.requireActiveSession()
     if (this.subagentAddress === undefined) {
-      valueOf(await this.requireClient().sessions.cancel({ sessionId: sessionId as SessionId }))
+      await this.requireClient().sessionCancel({ sessionId: sessionId as SessionId })
     } else if (this.subagentAddress.mode === 'continuable') {
-      valueOf(await this.requireClient().subagents.interrupt(this.subagentAddress))
+      await this.requireClient().subagentInterrupt(this.subagentAddress.childSessionId, this.subagentAddress.parentSessionId)
     }
   }
 
@@ -928,19 +997,19 @@ export class HarnessGatewayService implements vscode.Disposable {
       childSessionId: childSessionId as SessionId,
       mode,
     }
-    const history = valueOf(await this.requireClient().subagents.history({ ...address, maxMessages: 80 }))
-    const list = valueOf(await this.requireClient().subagents.list({ parentSessionId: childSessionId as SessionId }))
+    const list = await this.requireClient().subagentList(childSessionId)
     this.subagentAddress = address
     this.activeSessionId = childSessionId
-    this.entries = history.events
-    this.hasMore = history.hasMore
+    this.followCursor.set(childSessionId, 0)
+    this.entries = []
+    this.hasMore = false
     this.models = undefined
     this.skills = []
     this.jobs = []
     this.queue = []
     this.subagents = list.entries
     this.subagentCount = list.entries.length
-    this.projections = recordValue(history.projections?.values)
+    this.projections = {}
     this.approvals.clear()
     this.questions.clear()
     this.fireChange()
@@ -975,12 +1044,12 @@ export class HarnessGatewayService implements vscode.Disposable {
     if (reasoningEffort !== undefined && reasoningEffort !== '') {
       resolved = resolveEffortIntent(reasoningEffort as EffortIntent, this.reasoningEffortOptions(provider, resolvedModel), this.autoSignals(signals))
     }
-    const selected = valueOf(await this.requireClient().sessions.selectModel({
+    const selected = await this.requireClient().sessionSelectModel({
       sessionId: sessionId as SessionId,
       provider,
       model: resolvedModel,
       ...(resolved === undefined ? {} : { reasoningEffort: resolved }),
-    }))
+    })
     if (this.models !== undefined) this.models = { ...this.models, current: selected.selected }
     // Commit the per-session intent only after the harness accepted the
     // change, so a failed RPC cannot leave a stale intent behind.
@@ -1032,10 +1101,7 @@ export class HarnessGatewayService implements vscode.Disposable {
     const sessionId = this.activeSessionId
     const summary = sessionId === undefined ? undefined : this.summaries.get(sessionId)
     if (sessionId !== undefined && summary?.blank === true) {
-      valueOf(await this.requireClient().agentPresets.select({
-        sessionId: sessionId as SessionId,
-        agentPreset,
-      }))
+      await this.requireClient().agentPresetSelect(sessionId as SessionId, agentPreset)
       this.summaries.set(sessionId, { ...summary, agentPreset })
     }
     this.fireChange()
@@ -1072,7 +1138,7 @@ export class HarnessGatewayService implements vscode.Disposable {
 
   async createGoal(objective: string): Promise<void> {
     const sessionId = this.requireActiveSession()
-    valueOf(await this.requireClient().goals.create({ sessionId: sessionId as SessionId, objective }))
+    await this.requireClient().goalCreate(sessionId as SessionId, { objective })
   }
 
   async mutateGoal(action: 'pause' | 'resume' | 'complete' | 'clear'): Promise<void> {
@@ -1080,19 +1146,12 @@ export class HarnessGatewayService implements vscode.Disposable {
     const goal = projectionGoal(this.projections.goal)
     if (goal === undefined) throw new Error(vscode.l10n.t('The current session has no goal.'))
     const ref = { id: goal.id as never, revision: goal.revision }
-    const api = this.requireClient().goals
-    if (action === 'pause') valueOf(await api.pause({ sessionId: sessionId as SessionId, ref }))
-    else if (action === 'resume') valueOf(await api.resume({ sessionId: sessionId as SessionId, ref }))
-    else if (action === 'complete') valueOf(await api.complete({ sessionId: sessionId as SessionId, ref }))
-    else valueOf(await api.clear({ sessionId: sessionId as SessionId, ref }))
+    await this.requireClient().goalAction(action, sessionId as SessionId, ref)
   }
 
   async rename(title: string): Promise<void> {
     const sessionId = this.requireActiveSession()
-    const renamed = valueOf(await this.requireClient().sessions.rename({
-      sessionId: sessionId as SessionId,
-      title,
-    }))
+    const renamed = await this.requireClient().sessionRename({ sessionId: sessionId as SessionId, title })
     // A manual rename makes the title the user's own: a later first message
     // must not overwrite it, so the session opts out of auto-titling.
     this.metaStore.markAutoTitled(sessionId)
@@ -1102,10 +1161,10 @@ export class HarnessGatewayService implements vscode.Disposable {
 
   async fork(atSeq?: number): Promise<void> {
     const sessionId = this.requireActiveSession()
-    const forked = valueOf(await this.requireClient().sessions.fork({
+    const forked = await this.requireClient().sessionFork({
       sessionId: sessionId as SessionId,
       ...(atSeq === undefined ? {} : { atSeq }),
-    }))
+    })
     await this.refreshSessionList()
     await this.selectSession(String(forked.sessionId))
   }
@@ -1266,11 +1325,8 @@ export class HarnessGatewayService implements vscode.Disposable {
   async answerApproval(key: string, outcome: 'allowed-once' | 'rejected'): Promise<void> {
     const pending = this.approvals.get(key)
     if (pending === undefined) throw new Error(vscode.l10n.t('This approval request is no longer active.'))
-    await this.respond(pending.rpcId, {
-      sessionId: this.requireActiveSession(),
-      approvalId: pending.approvalId,
-      outcome,
-    })
+    this.approvals.delete(key)
+    await this.respondRemoteEvent(pending.clientId, pending.eventId, { kind: 'result', value: outcome })
   }
 
   async answerQuestions(
@@ -1279,9 +1335,10 @@ export class HarnessGatewayService implements vscode.Disposable {
   ): Promise<void> {
     const pending = this.questions.get(key)
     if (pending === undefined) throw new Error(vscode.l10n.t('This question is no longer active.'))
-    await this.respond(pending.rpcId, {
-      sessionId: this.requireActiveSession(),
-      answer: {
+    this.questions.delete(key)
+    await this.respondRemoteEvent(pending.clientId, pending.eventId, {
+      kind: 'result',
+      value: {
         answers: answers.map((answer) => ({
           id: answer.id,
           selected: [...answer.selected],
@@ -1301,126 +1358,280 @@ export class HarnessGatewayService implements vscode.Disposable {
     this.streamAbort?.abort()
     const abort = new AbortController()
     this.streamAbort = abort
-    void this.pumpMux(abort.signal)
-    void this.pumpHost(abort.signal)
+    void this.pumpControl(abort.signal)
+    void this.pumpRemoteEvents(abort.signal)
+    void this.pumpWorkspace(abort.signal)
+    void this.pumpActiveFollow(abort.signal)
   }
 
-  private async pumpMux(signal: AbortSignal): Promise<void> {
+  /** Host-wide live state (queue/jobs/projections): `session/control`. */
+  private async pumpControl(signal: AbortSignal): Promise<void> {
     while (!signal.aborted) {
       try {
-        for await (const envelope of this.requireClient().events.mux({}, signal, () => this.markConnected())) {
-          this.handleMux(envelope.rpcId, envelope.payload)
+        for await (const frame of this.requireClient().sessionControl(signal)) {
+          this.handleControl(frame)
+          this.markConnected()
         }
       } catch (cause) {
-        if (!signal.aborted) this.output.appendLine(vscode.l10n.t('[gateway] Reconnecting Mux stream: {0}', errorMessage(cause)))
+        if (!signal.aborted) this.output.appendLine(vscode.l10n.t('[gateway] Reconnecting control stream: {0}', errorMessage(cause)))
       }
       if (!signal.aborted) await this.waitToReconnect(signal)
     }
   }
 
-  private async pumpHost(signal: AbortSignal): Promise<void> {
+  /** Host-wide forwarded events (session added/removed/status, commands, …): `$events`. */
+  private async pumpRemoteEvents(signal: AbortSignal): Promise<void> {
     while (!signal.aborted) {
       try {
-        for await (const envelope of this.requireClient().events.host({}, signal, () => this.markConnected())) {
-          this.handleHost(envelope.payload)
+        for await (const frame of this.requireClient().remoteEvents(signal)) {
+          const remote = frame as RemoteEvent & { readonly type?: string }
+          if (remote.type === 'ready') {
+            this.remoteEventClientId = String((remote as { readonly clientId?: string }).clientId ?? '')
+            this.markConnected()
+            continue
+          }
+          if (remote.type === 'waterfall') {
+            const event = remote as unknown as {
+              readonly type: 'waterfall'
+              readonly event: string
+              readonly eventId: string
+              readonly agentId: string
+              readonly request: Record<string, unknown>
+            }
+            this.handleWaterfall(event)
+            continue
+          }
+          if (remote.type === 'cancel') {
+            const cancelled = (remote as unknown as { readonly eventId: string }).eventId
+            this.approvals.delete(`approval:${cancelled}`)
+            this.questions.delete(`question:${cancelled}`)
+            this.fireChange()
+            continue
+          }
+          if (remote.type === 'emit') {
+            this.handleRemoteEvent(remote.event, remote.args)
+          }
         }
       } catch (cause) {
-        if (!signal.aborted) this.output.appendLine(vscode.l10n.t('[gateway] Reconnecting Host stream: {0}', errorMessage(cause)))
+        if (!signal.aborted) this.output.appendLine(vscode.l10n.t('[gateway] Reconnecting remote-event stream: {0}', errorMessage(cause)))
       }
       if (!signal.aborted) await this.waitToReconnect(signal)
     }
   }
 
-  private handleMux(rpcId: RpcId, frame: MuxFrame): void {
-    if (frame.type === 'session/event') {
-      const id = String(frame.sessionId)
-      if (id === this.activeSessionId) this.acceptEvent({ event: frame.event, ...(frame.view === undefined ? {} : { view: frame.view }) })
-      const summary = this.summaries.get(id)
-      if (summary !== undefined) {
-        this.summaries.set(id, {
-          ...summary,
-          updatedAt: Math.max(summary.updatedAt, frame.event.time),
-          blank: frame.event.type === 'turn/start' ? false : summary.blank,
-        })
+  /** Workspace/browse state (archived set): `workspace/follow`. */
+  private async pumpWorkspace(signal: AbortSignal): Promise<void> {
+    while (!signal.aborted) {
+      try {
+        for await (const frame of this.requireClient().workspaceFollow(signal)) {
+          this.handleWorkspace(frame)
+          this.markConnected()
+        }
+      } catch (cause) {
+        if (!signal.aborted) this.output.appendLine(vscode.l10n.t('[gateway] Reconnecting workspace stream: {0}', errorMessage(cause)))
       }
-      this.maybeAutoTitle(id, frame.event)
-      if (frame.event.type === 'turn/end') {
-        this.pendingQueue.release(id)
-        this.maybeAutoMergeWorktree(id)
-        this.metaStore.recordTurnChanges(id, frame.event, this.entries, id === this.activeSessionId, (sessionId) => this.summaries.has(sessionId))
+      if (!signal.aborted) await this.waitToReconnect(signal)
+    }
+  }
+
+  /** Keeps the active session's follow stream in sync with the current selection. */
+  private async pumpActiveFollow(signal: AbortSignal): Promise<void> {
+    while (!signal.aborted) {
+      if (this.activeSessionId === undefined) {
+        await this.waitToReconnect(signal)
+        continue
       }
-    } else if (frame.type === 'approval/requested' && String(frame.sessionId) === this.activeSessionId) {
-      const key = `approval:${String(rpcId)}`
-      this.approvals.set(key, {
-        key,
-        rpcId,
-        approvalId: String(frame.approvalId),
-        toolName: frame.toolName,
-        ...(frame.reason === undefined ? {} : { reason: frame.reason }),
+      const sessionId = this.activeSessionId
+      const address = this.activeFollowAddress()
+      if (address === undefined) {
+        await this.waitToReconnect(signal)
+        continue
+      }
+      const followAddress = address
+      // A per-follow abort lets selectSession force a fresh snapshot when the
+      // selection changes. Without it the pump can sit idle on the old
+      // session's live stream (which never re-sends its snapshot), so a
+      // switched-away-and-back session renders an empty conversation.
+      const followAbort = new AbortController()
+      this.followAbort = followAbort
+      const onSharedAbort = (): void => followAbort.abort()
+      signal.addEventListener('abort', onSharedAbort, { once: true })
+      try {
+        for await (const frame of this.requireClient().sessionFollow({ address: followAddress as import('./gateway-wire.js').SessionAddress, maxMessages: 80 }, followAbort.signal)) {
+          if (this.activeSessionId !== sessionId) break
+          this.handleFollowFrame(sessionId, frame)
+          this.markConnected()
+        }
+      } catch (cause) {
+        if (!signal.aborted && !followAbort.signal.aborted) {
+          this.output.appendLine(vscode.l10n.t('[gateway] Reconnecting session stream: {0}', errorMessage(cause)))
+        }
+      }
+      signal.removeEventListener('abort', onSharedAbort)
+      if (this.followAbort === followAbort) this.followAbort = undefined
+      if (!signal.aborted && !followAbort.signal.aborted && this.activeSessionId === sessionId) await this.waitToReconnect(signal)
+    }
+  }
+
+  private activeFollowAddress(): import('./gateway-wire.js').SessionAddress | undefined {
+    if (this.activeSessionId === undefined) return undefined
+    if (this.subagentAddress !== undefined) {
+      return { kind: 'subagent', parentSessionId: this.subagentAddress.parentSessionId, childSessionId: this.subagentAddress.childSessionId, mode: this.subagentAddress.mode }
+    }
+    return { kind: 'session', sessionId: this.activeSessionId as SessionId }
+  }
+
+  private handleFollowFrame(sessionId: string, frame: FollowFrame): void {
+    if (frame.type === 'snapshot') {
+      const records = NodeGatewayClient.expandRecords(frame.records as unknown[]) as HistoryEntry[]
+      this.followCursor.set(sessionId, frame.cursor)
+      // Merging keeps events received during the read (and repair re-reads).
+      this.entries = mergeHistory(records, this.entries)
+      this.hasMore = frame.hasMore
+      this.projections = recordValue((frame.projections as { readonly values?: Record<string, unknown> } | undefined)?.values)
+      this.applyTitleProjection(sessionId, projectionTitle((frame.projections as { readonly values?: Record<string, unknown> } | undefined)?.values))
+      this.resolveFollowSnapshotWaiter(sessionId)
+      this.fireChange()
+      return
+    }
+    const event = frame.event as unknown as HistoryEntry['event']
+    this.acceptEvent({ event })
+    const summary = this.summaries.get(sessionId)
+    if (summary !== undefined) {
+      this.summaries.set(sessionId, {
+        ...summary,
+        updatedAt: Math.max(summary.updatedAt, event.time),
+        blank: event.type === 'turn/start' ? false : summary.blank,
       })
-    } else if (frame.type === 'approval/resolved') {
-      for (const [key, pending] of this.approvals) {
-        if (pending.approvalId === String(frame.approvalId)) this.approvals.delete(key)
+    }
+    this.maybeAutoTitle(sessionId, event)
+    if (event.type === 'turn/end') {
+      this.pendingQueue.release(sessionId)
+      this.maybeAutoMergeWorktree(sessionId)
+      this.metaStore.recordTurnChanges(sessionId, event, this.entries, sessionId === this.activeSessionId, (id) => this.summaries.has(id))
+    }
+    this.fireChange()
+  }
+
+  private handleControl(frame: ControlFrame): void {
+    const active = this.activeSessionId
+    if (frame.type === 'baseline') {
+      if (active !== undefined) {
+        this.queue = frame.value.queues[active as SessionId] ?? this.queue
+        this.jobs = frame.value.jobs[active as SessionId] ?? this.jobs
       }
-    } else if (frame.type === 'question/requested' && String(frame.sessionId) === this.activeSessionId) {
-      const key = `question:${String(rpcId)}`
-      this.questions.set(key, {
-        key,
-        rpcId,
-        questions: frame.questions.map((question) => ({
-          id: question.id,
-          question: question.question,
-          ...(question.header === undefined ? {} : { header: question.header }),
-          ...(question.detail === undefined ? {} : { detail: question.detail }),
-          options: question.options ?? [],
-          multiSelect: question.multiSelect ?? false,
-        })),
-      })
-    } else if (frame.type === 'question/resolved') {
-      this.questions.delete(`question:${String(frame.questionRpcId)}`)
-    } else if (frame.type === 'session/jobs' && String(frame.sessionId) === this.activeSessionId) {
-      this.jobs = frame.jobs
-    } else if (frame.type === 'session/queue' && String(frame.sessionId) === this.activeSessionId) {
-      this.queue = frame.items
-    } else if (frame.type === 'session/projection') {
-      if (String(frame.sessionId) === this.activeSessionId) this.projections[frame.key] = frame.value
+      if (frame.value.projections !== undefined && active !== undefined) {
+        for (const [sessionId, projection] of Object.entries(frame.value.projections)) {
+          const value = (projection as { readonly values?: Record<string, unknown> }).values ?? {}
+          this.projections = { ...this.projections, ...value }
+          this.applyTitleProjection(sessionId, projectionTitle(value))
+        }
+      }
+    } else if (frame.type === 'queue') {
+      if (String(frame.sessionId) === active) this.queue = frame.items
+    } else if (frame.type === 'jobs') {
+      if (String(frame.sessionId) === active) this.jobs = frame.jobs
+    } else if (frame.type === 'projection') {
+      if (String(frame.sessionId) === active) this.projections[frame.key] = frame.value
       if (frame.key === 'title') this.applyTitleProjection(String(frame.sessionId), typeof frame.value === 'string' ? frame.value : undefined)
     }
     this.fireChange()
   }
 
-  private handleHost(frame: HostFrame): void {
-    if (frame.type === 'host/session-added') {
+  private handleRemoteEvent(event: string, args: readonly unknown[]): void {
+    if (event === 'api-session/added') {
+      const summary = args[0] as SessionSummary | undefined
+      if (summary !== undefined) this.summaries.set(String(summary.sessionId), summary)
       void this.refreshSessionList()
-    } else if (frame.type === 'host/session-removed') {
-      const removed = String(frame.sessionId)
+    } else if (event === 'api-session/removed') {
+      const removed = String(args[0] ?? '')
       this.summaries.delete(removed)
       this.pendingQueue.dropForSession(removed)
       this.pendingQueue.forget(removed)
       this.metaStore.removeSession(removed)
-    } else if (frame.type === 'host/archived-sessions-changed') {
-      // A host snapshot is authoritative: establish the baseline before
-      // installing the set so the sweep inside install() treats the archived
-      // ids as authoritative, even on the first frame.
-      this.archives.installFromHost(frame.archivedSessionIds.map(String))
-    } else if (frame.type === 'host/session-status') {
-      const id = String(frame.sessionId)
+    } else if (event === 'api-session/status') {
+      const id = String(args[0] ?? '')
+      const running = args[1] === true
       const summary = this.summaries.get(id)
-      if (summary !== undefined) this.summaries.set(id, { ...summary, running: frame.running, blank: frame.running ? false : summary.blank })
-      if (!frame.running) this.pendingQueue.forget(id)
-    } else if (frame.type === 'host/agent-error') {
-      this.output.appendLine(`[agent ${String(frame.sessionId)}] ${frame.message}`)
-    } else if (frame.type === 'host/remote-event'
-      && (frame.event === 'commands/change' || frame.event === 'agent-preset/selected')) {
+      if (summary !== undefined) this.summaries.set(id, { ...summary, running, blank: running ? false : summary.blank })
+      if (!running) this.pendingQueue.forget(id)
+    } else if (event === 'api-session/activity') {
+      const id = String(args[0] ?? '')
+      const updatedAt = typeof args[1] === 'number' ? args[1] : undefined
+      const summary = this.summaries.get(id)
+      if (summary !== undefined && updatedAt !== undefined) this.summaries.set(id, { ...summary, updatedAt: Math.max(summary.updatedAt, updatedAt) })
+    } else if (event === 'api-session/error') {
+      this.output.appendLine(`[agent ${String(args[0] ?? '')}] ${String(args[1] ?? '')}`)
+    } else if (event === 'commands/change' || event === 'agent-preset/selected') {
       void this.refreshCommands()
-    } else if (frame.type === 'host/remote-event'
-      && (frame.event === 'llm/adapters-updated' || frame.event === 'settings/document-updated')) {
+    } else if (event === 'llm/adapters-updated' || event === 'settings/document-updated') {
       void Promise.all([
         this.connectionSettings.refresh(),
         this.refreshModelCatalog(),
       ]).catch((cause: unknown) => {
         this.output.appendLine(vscode.l10n.t('[gateway] Failed to refresh provider settings: {0}', errorMessage(cause)))
       })
+    }
+    this.fireChange()
+  }
+
+  private handleWaterfall(frame: {
+    readonly event: string
+    readonly eventId: string
+    readonly request: Record<string, unknown>
+  }): void {
+    const clientId = this.remoteEventClientId ?? ''
+    if (frame.event === 'approval/asked' && String(frame.request.sessionId ?? this.activeSessionId) === this.activeSessionId) {
+      const key = `approval:${frame.eventId}`
+      this.approvals.set(key, {
+        key,
+        clientId,
+        eventId: frame.eventId,
+        approvalId: frame.eventId,
+        toolName: typeof frame.request.toolName === 'string' ? frame.request.toolName : '',
+        ...(typeof frame.request.reason === 'string' ? { reason: frame.request.reason } : {}),
+      })
+    } else if (frame.event === 'question/asked' && String(frame.request.sessionId ?? this.activeSessionId) === this.activeSessionId) {
+      const key = `question:${frame.eventId}`
+      const raw = Array.isArray(frame.request.questions) ? frame.request.questions : []
+      this.questions.set(key, {
+        key,
+        clientId,
+        eventId: frame.eventId,
+        questions: raw.map((question) => {
+          const record = question as Record<string, unknown>
+          return {
+            id: typeof record.id === 'string' ? record.id : '',
+            question: typeof record.question === 'string' ? record.question : '',
+            ...(typeof record.header === 'string' ? { header: record.header } : {}),
+            ...(typeof record.detail === 'string' ? { detail: record.detail } : {}),
+            options: Array.isArray(record.options)
+              ? record.options.map((option) => {
+                if (typeof option === 'string') return { label: option }
+                const candidate = option as Record<string, unknown>
+                return {
+                  label: typeof candidate.label === 'string' ? candidate.label : typeof candidate.value === 'string' ? candidate.value : '',
+                  ...(typeof candidate.description === 'string' ? { description: candidate.description } : {}),
+                }
+              })
+              : [],
+            multiSelect: record.multiSelect === true,
+          }
+        }),
+      })
+    }
+    this.fireChange()
+  }
+
+  private handleWorkspace(frame: unknown): void {
+    const value = frame as { readonly type?: string; readonly value?: { readonly archivedSessionIds?: readonly unknown[] }; readonly archivedSessionIds?: readonly unknown[] }
+    const archived = value.type === 'baseline' ? value.value?.archivedSessionIds : value.type === 'archived' ? value.archivedSessionIds : undefined
+    if (archived !== undefined) {
+      this.archivedFromHost = archived.map(String)
+      // A host snapshot is authoritative: establish the baseline before
+      // installing the set so the sweep inside install() treats the archived
+      // ids as authoritative, even on the first frame.
+      this.archives.installFromHost(this.archivedFromHost)
     }
     this.fireChange()
   }
@@ -1436,20 +1647,52 @@ export class HarnessGatewayService implements vscode.Disposable {
     else this.entries.push(entry)
   }
 
+  private resolveFollowSnapshotWaiter(sessionId: string): void {
+    const resolve = this.followSnapshotWaiters.get(sessionId)
+    this.followSnapshotWaiters.delete(sessionId)
+    resolve?.()
+  }
+
+  /** Awaits the follow snapshot for `sessionId` (bounded; moves on without it). */
+  private async waitForFollowSnapshot(sessionId: string, timeoutMs = 10_000): Promise<void> {
+    const waiter = new Promise<void>((resolve) => {
+      this.followSnapshotWaiters.set(sessionId, resolve)
+    })
+    const timer = setTimeout(() => this.resolveFollowSnapshotWaiter(sessionId), timeoutMs)
+    try {
+      await waiter
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  private followAddressFor(sessionId: string): import('./gateway-wire.js').SessionAddress | undefined {
+    const summary = this.summaries.get(sessionId)
+    if (summary?.origin === 'subagent' && summary.parentSessionId !== undefined) {
+      return { kind: 'subagent', parentSessionId: summary.parentSessionId, childSessionId: sessionId as SessionId, mode: summary.origin === 'subagent' ? 'continuable' : 'one-shot' }
+    }
+    return { kind: 'session', sessionId: sessionId as SessionId }
+  }
+
   private async repairHistory(): Promise<void> {
     if (this.activeSessionId === undefined) return
     try {
-      const history = this.subagentAddress === undefined
-        ? valueOf(await this.requireClient().sessions.history({
-          sessionId: this.activeSessionId as SessionId,
+      const address = this.activeFollowAddress()
+      if (address === undefined) return
+      // The follow stream heals itself on reconnect; a full page re-read is
+      // only needed when the stream is absent, so refresh via the control
+      // baseline instead of a second history RPC.
+      await this.refreshSessionList()
+      const cursor = this.followCursor.get(this.activeSessionId)
+      if (cursor !== undefined) {
+        const page = await this.requireClient().sessionPage({
+          address,
+          throughSeq: cursor,
           maxMessages: 80,
-        }))
-        : valueOf(await this.requireClient().subagents.history({
-          ...this.subagentAddress,
-          maxMessages: 80,
-        }))
-      this.entries = history.events
-      this.hasMore = history.hasMore
+        })
+        this.entries = NodeGatewayClient.expandRecords(page.records as unknown[]) as HistoryEntry[]
+        this.hasMore = page.hasMore
+      }
       this.fireChange()
     } catch (cause) {
       this.output.appendLine(vscode.l10n.t('[gateway] Failed to repair session history: {0}', errorMessage(cause)))
@@ -1457,8 +1700,10 @@ export class HarnessGatewayService implements vscode.Disposable {
   }
 
   private async refreshSessionList(): Promise<void> {
-    const items = valueOf(await this.requireClient().sessions.list({})).items
-    this.summaries = new Map(items.map((summary) => [String(summary.sessionId), summary]))
+    const items = await this.requireClient().sessionList()
+    const seen = new Set(items.map((summary) => String(summary.sessionId)))
+    for (const key of [...this.summaries.keys()]) if (!seen.has(key)) this.summaries.delete(key)
+    for (const summary of items) this.summaries.set(String(summary.sessionId), summary)
     this.fireChange()
   }
 
@@ -1513,17 +1758,23 @@ export class HarnessGatewayService implements vscode.Disposable {
   }
 
   private async refreshPresets(): Promise<void> {
-    this.presets = valueOf(await this.requireClient().agentPresets.list({})).presets
+    this.presets = (await this.requireClient().agentPresetList()).presets
     this.fireChange()
   }
 
   private orderedSummaries(): SessionSummary[] {
-    return [...this.summaries.values()].sort((left, right) => {
-      const leftRank = this.metaStore.metaSortRankFor(String(left.sessionId))
-      const rightRank = this.metaStore.metaSortRankFor(String(right.sessionId))
-      if (leftRank !== rightRank) return leftRank - rightRank
-      return right.updatedAt - left.updatedAt
-    })
+    return [...this.summaries.values()]
+      // Blank (never-written) sessions are drafts, not history: they must not
+      // appear in the history panel or be auto-resumed. They stay in `summaries`
+      // so the composer can still use one it just created, and a blank draft is
+      // dropped as soon as the user switches away or a real turn begins.
+      .filter((summary) => !summary.blank)
+      .sort((left, right) => {
+        const leftRank = this.metaStore.metaSortRankFor(String(left.sessionId))
+        const rightRank = this.metaStore.metaSortRankFor(String(right.sessionId))
+        if (leftRank !== rightRank) return leftRank - rightRank
+        return right.updatedAt - left.updatedAt
+      })
   }
 
   /** The first workspace folder open in this window, or undefined when none is. */
@@ -1550,7 +1801,6 @@ export class HarnessGatewayService implements vscode.Disposable {
 
   private async commandsFor(sessionId: string): Promise<readonly CommandEntry[]> {
     const client = this.requireClient()
-    if (!(client instanceof NodeGatewayClient)) return projectionCommands(undefined, this.labels)
     return projectionCommands(await client.listCommands(sessionId), this.labels)
   }
 
@@ -1591,9 +1841,12 @@ export class HarnessGatewayService implements vscode.Disposable {
     const summary = this.summaries.get(sessionId)
     if (summary === undefined) return
     const existing = summary.projections
-    const projections = existing === undefined
+    const values = existing === undefined
+      ? { title }
+      : { ...(existing.values as Record<string, unknown>), title }
+    const projections: SessionSummary['projections'] = existing === undefined
       ? { asOfSeq: -1, values: { title } }
-      : { ...existing, values: { ...existing.values, title } }
+      : { ...existing, values: { ...(existing.values as Record<string, unknown>), title } }
     this.summaries.set(sessionId, { ...summary, projections })
   }
 
@@ -1623,10 +1876,8 @@ export class HarnessGatewayService implements vscode.Disposable {
     })
   }
 
-  private async respond(rpcId: RpcId, value: unknown): Promise<void> {
-    const message = respondMessage(rpcId, value)
-    const receipt = await this.requireClient().respond(message)
-    if (!receipt.accepted) throw new Error(vscode.l10n.t('Harness rejected the response: {0}', receipt.reason))
+  private async respondRemoteEvent(clientId: string, eventId: string, outcome: unknown): Promise<void> {
+    await this.requireClient().resolveRemoteEvent(clientId, eventId, outcome)
   }
 
   private markConnected(): void {
@@ -1656,7 +1907,7 @@ export class HarnessGatewayService implements vscode.Disposable {
     }
   }
 
-  private requireClient(): IApiClient {
+  private requireClient(): NodeGatewayClient {
     if (this.client === undefined) throw new Error(vscode.l10n.t('Harness Gateway is not connected.'))
     return this.client
   }
@@ -1688,7 +1939,24 @@ export class HarnessGatewayService implements vscode.Disposable {
     }, 16)
   }
 }
+/** Error-code extractor for steer fallbacks (RemoteError leaf fields). */
+function codeOf(cause: unknown): { readonly code?: string; readonly message?: string } {
+  const record = typeof cause === 'object' && cause !== null ? cause as Record<string, unknown> : undefined
+  const code = typeof record?.code === 'string' ? record.code : undefined
+  const message = typeof record?.message === 'string'
+    ? record.message
+    : cause instanceof Error ? cause.message : String(cause)
+  return { ...(code === undefined ? {} : { code }), message }
+}
+
+/** Mints a client-side prompt correlation id (branded at the RPC edge). */
+function newPromptRequestId(): import('@deepseek-ai/dsh-api-session-controller/types').SessionRequestId {
+  return `vr-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}` as unknown as import('@deepseek-ai/dsh-api-session-controller/types').SessionRequestId
+}
+
 const START_BASELINE_TIMEOUT_S = 45
+/** Remembers the last session the user had open so a reload resumes it. */
+const LAST_SESSION_STATE_KEY = 'deepseekHarness.lastSessionId'
 const DEFAULT_REASONING_OPTIONS: readonly { readonly id: string }[] = [
   { id: 'off' }, { id: 'low' }, { id: 'high' }, { id: 'max' },
 ]

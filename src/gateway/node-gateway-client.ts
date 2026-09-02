@@ -1,80 +1,136 @@
+/**
+ * Node transport for the Harness Gateway (dsh 0.1.2 Typert Remote protocol).
+ *
+ * Unary calls POST a Connection `client-request` envelope to `/api/<endpoint>`
+ * with the endpoint's named `{ args }` payload; event and domain streams run
+ * over a single `/api/remote.mux` WebSocket with `open`/`item`/`end`/`error`
+ * frames. The Gateway authorizes through a launch-token exchange: the boot
+ * URL carries `?token=`, which trades for a signed HttpOnly cookie on the
+ * index request — every subsequent call sends that cookie.
+ *
+ * VS Code's extension host is not a browser, so the official browser module
+ * loader client is unavailable; this is the plain transport equivalent.
+ */
 import type { RawData } from 'ws'
 import WebSocket from 'ws'
+import { request as httpRequest } from 'node:http'
+import { request as httpsRequest } from 'node:https'
 import { Agent as UndiciAgent, fetch as undiciFetch } from 'undici'
+import { RpcId, serverResponseSchema, type ClientRequest, type ConnectionRpcResult, type ServerResponse } from '@deepseek-ai/dsh-client-connection'
+import { decodeStorageRecord } from '@deepseek-ai/dsh-session/chunk-rows'
+import type { SessionPage } from '@deepseek-ai/dsh-api-session-controller/types'
+import type { AgentPresetRoster } from '@deepseek-ai/dsh-agent-presets/types'
+import type { CommandDescriptor as WireCommandDescriptor } from '@deepseek-ai/dsh-commands/types'
+import type { CredentialInfo } from '@deepseek-ai/dsh-credentials/types'
+import type { CreateGoalRequest, CreateGoalResult } from '@deepseek-ai/dsh-goal/types'
+import type { LlmConfigurableProvider, LlmDiscoveredModel, LlmModelDiscoveryRequest, LlmProviderInfo } from '@deepseek-ai/dsh-llm/types'
+import type { SettingsDescribeValue, SettingsNamespaceView, SettingsPathOpView } from '@deepseek-ai/dsh-settings/types'
+import type { SubagentCatalog, SubagentInterruptReceipt, SubagentPromptReceipt, SubagentPromptRequest } from '@deepseek-ai/dsh-subagent/client'
 import type {
-  ApiProxy,
-  HostFrame,
-  MuxFrame,
-  RpcRequest,
-  ServerRequest,
-} from '@deepseek-ai/dsh-host-apiproxy/api'
-import { hostFrameSchema, muxFrameSchema } from '@deepseek-ai/dsh-host-apiproxy/api/events.schema'
-import { serverRequestSchema, serverResponseSchema } from '@deepseek-ai/dsh-host-apiproxy/api/rpc.schema'
-import { AbstractApiClient } from '@deepseek-ai/dsh-host-apiproxy/client'
-import {
-  parseImportDiscoverResult,
-  parseImportResult,
-  type ImportDiscoverRequest,
-  type ImportDiscoverResult,
-  type ImportRequest,
-  type ImportResult,
-} from '../import/types.js'
-
-type FrameParser<F> = { parse(value: unknown): F }
-type SocketItem<F> = { readonly kind: 'frame'; readonly envelope: RpcRequest<F> } | { readonly kind: 'end' }
+  SessionControlFrame,
+  SessionCreateRequest,
+  SessionCreateValue,
+  SessionFollowFrame,
+  SessionFollowRequest,
+  SessionListValue,
+  SessionPageRequest,
+  SessionPromptRequest,
+  SessionPromptValue,
+  SessionQueueMutation,
+  SessionRenameValue,
+  SessionSearchValue,
+  SessionSelectModelValue,
+  SessionSummary,
+  SessionUpdateQueueValue,
+  SkillListValue,
+  WorkspaceArchiveValue,
+  WorkspaceFollowFrame,
+} from './domain-api.js'
+import { parseImportDiscoverResult, parseImportResult, type ImportDiscoverRequest, type ImportDiscoverResult, type ImportRequest, type ImportResult } from '../import/types.js'
 
 /** A host-registered slash command descriptor, as served by `commands/list`. */
-export interface HostCommandDescriptor {
-  readonly name: string
-  readonly description: string
-  readonly input?: { readonly hint: string }
-}
+export interface HostCommandDescriptor extends WireCommandDescriptor {}
 
 export interface HostCommandExecution {
   readonly commandId: string
-  /** RC.6 returns the settled result; newer Hosts may keep admission-only semantics. */
   readonly result?: { readonly kind: 'success' | 'error'; readonly text?: string }
 }
 
+type RemoteValue<T> = ConnectionRpcResult<T>
+
+/** One decoded history record before chunk expansion. */
+type WireRecord = { readonly type: 'event'; readonly event: { readonly type: string; readonly seq: number; readonly time: number; readonly data: unknown } } | { readonly type: 'chunks'; readonly event: { readonly type: string; readonly seq: number; readonly time: number; readonly data: unknown } }
+
 /**
- * Node transport for the Harness Gateway. Unary calls use the official typed
- * fetch client; event downlinks use `ws` because VS Code's extension host is
- * not a browser and does not expose the Harness browser module loader.
+ * Node transport for the Harness Gateway. Unary calls use a typed fetch
+ * client; streams use `ws` because VS Code's extension host is not a browser
+ * and does not expose the Harness browser module loader.
  */
-export class NodeGatewayClient extends AbstractApiClient {
+export class NodeGatewayClient {
+  private readonly baseUrl: string
+  private readonly token: string | undefined
+  private cookie: string | undefined
+  private rpcCounter = 0
+
   constructor(
-    private readonly baseUrl: string,
+    url: string,
     private readonly importTimeoutMs = 30_000,
   ) {
-    super(30_000)
+    const parsed = new URL(url)
+    this.token = parsed.searchParams.get('token') ?? undefined
+    parsed.searchParams.delete('token')
+    parsed.search = parsed.search
+    this.baseUrl = parsed.origin
+  }
+
+  /**
+   * Exchanges the launch token for the browser-session cookie, once.
+   *
+   * Uses a raw node:http GET because the index response is a 303 redirect:
+   * `fetch` follows it (and then 401s without a cookie jar), while the raw
+   * request reads the `set-cookie` exchange directly.
+   */
+  private async ensureAuthenticated(): Promise<void> {
+    if (this.cookie !== undefined || this.token === undefined) return
+    const url = new URL('/', this.baseUrl)
+    url.searchParams.set('token', this.token)
+    const cookie = await new Promise<string>((resolve, reject) => {
+      const requester = url.protocol === 'https:' ? httpsRequest : httpRequest
+      const req = requester(url, { method: 'GET', headers: { accept: 'text/html' } }, (res) => {
+        const raw = (res.headers['set-cookie'] ?? []) as string[]
+        const joined = raw.map((value) => value.split(';')[0] ?? '').filter((value) => value.length > 0).join('; ')
+        res.resume()
+        resolve(joined)
+      })
+      req.on('error', reject)
+      req.setTimeout(5_000, () => {
+        req.destroy(new Error('Gateway authentication exchange timed out.'))
+      })
+      req.end()
+    })
+    this.cookie = cookie
   }
 
   /** Lists the slash commands the active Harness deployment registers for one session. */
-  async listCommands(sessionId: string): Promise<readonly HostCommandDescriptor[]> {
-    // Typert Remote endpoints use the generic Connection `{ args }` carrier;
-    // API Proxy methods use their payload directly. Keeping that envelope here
-    // is what lets the Host interceptor claim commands/list before fallback.
-    return this.callUnaryRaw<readonly HostCommandDescriptor[]>('commands/list', {
-      args: { agentId: sessionId },
-    })
+  async listCommands(agentId: string): Promise<readonly HostCommandDescriptor[]> {
+    const value = await this.callRaw<readonly HostCommandDescriptor[]>('commands/list', { agentId })
+    return value
   }
 
   /** Executes one registered Host slash command without sending it to the LLM. */
-  async executeCommand(sessionId: string, line: string): Promise<HostCommandExecution | undefined> {
-    return this.callUnaryRaw<HostCommandExecution | undefined>('commands/execute', {
-      // The typert descriptor declares `images` as a required strict field
-      // since dsh 0.1.1; host commands carry no attachments, so send an
-      // explicit empty list instead of omitting it.
-      args: { agentId: sessionId, line, images: [] },
-    })
+  async executeCommand(agentId: string, line: string): Promise<HostCommandExecution | undefined> {
+    const value = await this.callRaw<HostCommandExecution | undefined>('commands/execute', { agentId, line, images: [] })
+    return value
   }
 
   /** Downloads the session log ZIP (with descendant sessions) served by the Gateway. */
   async exportSession(sessionId: string, includeDescendants = true): Promise<Uint8Array> {
+    await this.ensureAuthenticated()
     const url = new URL('/api/session.export', this.baseUrl)
     url.searchParams.set('sessionId', sessionId)
     url.searchParams.set('includeDescendants', String(includeDescendants))
-    const response = await globalThis.fetch(url)
+    const response = await this.doFetch(url)
+    if (response.status === 404 || response.status === 405) throw new Error('SESSION_EXPORT_UNAVAILABLE')
     if (!response.ok) {
       const detail = await response.text().catch(() => '')
       throw new Error(`Export failed: HTTP ${response.status}${detail === '' ? '' : ` ${detail}`}`)
@@ -92,11 +148,211 @@ export class NodeGatewayClient extends AbstractApiClient {
     return await this.postImportApi('/api-import/import', request, parseImportResult)
   }
 
+  /** Session list (Typert `session/list`). */
+  async sessionList(cursor?: string): Promise<readonly SessionSummary[]> {
+    const value = await this.callRaw<SessionListValue>('session/list', { _request: cursor === undefined ? {} : { cursor } })
+    return value.items
+  }
+
+  /** Session create (Typert `session/create`). */
+  async sessionCreate(request: SessionCreateRequest): Promise<SessionCreateValue> {
+    return await this.callRaw<SessionCreateValue>('session/create', { request })
+  }
+
+  /** Session prompt (Typert `session/prompt`). */
+  async sessionPrompt(request: SessionPromptRequest): Promise<SessionPromptValue> {
+    return await this.callRaw<SessionPromptValue>('session/prompt', { request })
+  }
+
+  /** Session cancel (Typert `session/cancel`). */
+  async sessionCancel(request: { readonly sessionId: unknown }): Promise<{ readonly accepted: true }> {
+    return await this.callRaw<{ readonly accepted: true }>('session/cancel', { request })
+  }
+
+  /** Session rename (Typert `session/rename`). */
+  async sessionRename(request: { readonly sessionId: unknown; readonly title: string }): Promise<SessionRenameValue> {
+    return await this.callRaw<SessionRenameValue>('session/rename', { request })
+  }
+
+  /** Session fork (Typert `session/fork`). */
+  async sessionFork(request: { readonly sessionId: unknown; readonly atSeq?: number }): Promise<{ readonly sessionId: unknown }> {
+    return await this.callRaw<{ readonly sessionId: unknown }>('session/fork', { request })
+  }
+
+  /** Session search (Typert `session/search`). */
+  async sessionSearch(request: { readonly query: string }): Promise<SessionSearchValue> {
+    return await this.callRaw<SessionSearchValue>('session/search', { request })
+  }
+
+  /** Session model selection (Typert `session/selectModel`). */
+  async sessionSelectModel(request: { readonly sessionId: unknown; readonly provider: string; readonly model: string; readonly reasoningEffort?: string }): Promise<SessionSelectModelValue> {
+    return await this.callRaw<SessionSelectModelValue>('session/selectModel', { request })
+  }
+
+  /** Session model catalog (Typert `session/modelCatalog`). */
+  async sessionModelCatalog(): Promise<import('@deepseek-ai/dsh-api-session-controller/types').ModelCatalog> {
+    return await this.callRaw<import('@deepseek-ai/dsh-api-session-controller/types').ModelCatalog>('session/modelCatalog', {})
+  }
+
+  /** Session queue mutation (Typert `session/updateQueue`). */
+  async sessionUpdateQueue(request: { readonly sessionId: unknown; readonly itemId: unknown; readonly action: SessionQueueMutation }): Promise<SessionUpdateQueueValue> {
+    return await this.callRaw<SessionUpdateQueueValue>('session/updateQueue', { request })
+  }
+
+  /** One backward page of a session log (Typert `session/page`). */
+  async sessionPage(request: SessionPageRequest): Promise<SessionPage> {
+    return await this.callRaw<SessionPage>('session/page', { request })
+  }
+
+  /** Session event stream: snapshot window plus ordered events (Typert `session/follow`). */
+  sessionFollow(request: SessionFollowRequest, signal: AbortSignal): AsyncGenerator<SessionFollowFrame> {
+    return this.openStream<SessionFollowFrame>('session/follow', { request }, signal)
+  }
+
+  /** Host-wide live state stream (Typert `session/control`). */
+  sessionControl(signal: AbortSignal): AsyncGenerator<SessionControlFrame> {
+    return this.openStream<SessionControlFrame>('session/control', {}, signal)
+  }
+
+  /** Sub-agent catalog (Typert `subagents/list`). */
+  async subagentList(parentSessionId: unknown): Promise<SubagentCatalog> {
+    return await this.callRaw<SubagentCatalog>('subagents/list', { parentSessionId })
+  }
+
+  /** Sub-agent prompt (Typert `subagents/prompt`). */
+  async subagentPrompt(request: SubagentPromptRequest): Promise<SubagentPromptReceipt> {
+    return await this.callRaw<SubagentPromptReceipt>('subagents/prompt', { request })
+  }
+
+  /** Sub-agent interrupt (Typert `subagents/interruptByParent`). */
+  async subagentInterrupt(childSessionId: unknown, parentSessionId: unknown): Promise<SubagentInterruptReceipt> {
+    return await this.callRaw<SubagentInterruptReceipt>('subagents/interruptByParent', { childSessionId, parentSessionId, mode: 'continuable' })
+  }
+
+  /** Human-invocable skill catalog (Typert `skills/list`). */
+  async skillList(request: { readonly sessionId: unknown }): Promise<SkillListValue> {
+    return await this.callRaw<SkillListValue>('skills/list', { request })
+  }
+
+  /** Archive one session (Typert `workspace/archiveSession`). */
+  async workspaceArchiveSession(request: { readonly sessionId: unknown }): Promise<WorkspaceArchiveValue> {
+    return await this.callRaw<WorkspaceArchiveValue>('workspace/archiveSession', { request })
+  }
+
+  /** Workspace/browse state stream (Typert `workspace/follow`). */
+  workspaceFollow(signal: AbortSignal): AsyncGenerator<WorkspaceFollowFrame> {
+    return this.openStream<WorkspaceFollowFrame>('workspace/follow', {}, signal)
+  }
+
+  /** Agent preset roster (Typert `agentPresets/list`). */
+  async agentPresetList(): Promise<AgentPresetRoster> {
+    return await this.callRaw<AgentPresetRoster>('agentPresets/list', {})
+  }
+
+  /** Agent preset selection (Typert `agentPresets/select`). */
+  async agentPresetSelect(agentId: unknown, agentPreset: string): Promise<string> {
+    return await this.callRaw<string>('agentPresets/select', { agentId, agentPreset })
+  }
+
+  /** Goal creation (Typert `goals/create`). */
+  async goalCreate(agentId: unknown, request: CreateGoalRequest): Promise<CreateGoalResult> {
+    return await this.callRaw<CreateGoalResult>('goals/create', { agentId, request })
+  }
+
+  /** Goal lifecycle mutation (Typert `goals/{action}`). */
+  async goalAction(action: 'pause' | 'resume' | 'complete' | 'clear', agentId: unknown, ref: unknown): Promise<unknown> {
+    return await this.callRaw<unknown>(`goals/${action}`, { agentId, ref })
+  }
+
+  /** Submits one Remote Event waterfall outcome (Typert `$events/result`). */
+  async resolveRemoteEvent(clientId: string, eventId: string, outcome: unknown): Promise<void> {
+    await this.callRaw<unknown>('$events/result', { clientId, eventId, outcome })
+  }
+
+  /** Settings describe (Typert `settings/describe`). */
+  async settingsDescribe(): Promise<SettingsDescribeValue> {
+    return await this.callRaw<SettingsDescribeValue>('settings/describe', {})
+  }
+
+  /** Settings mutate (Typert `settings/mutate`). */
+  async settingsMutate(ns: string, ops: readonly SettingsPathOpView[], expectedRevision: number | undefined): Promise<SettingsNamespaceView> {
+    return await this.callRaw<SettingsNamespaceView>('settings/mutate', { ns, ops, expectedRevision })
+  }
+
+  /** Settings update (Typert `settings/update`). */
+  async settingsUpdate(ns: string, patch: Record<string, unknown>, expectedRevision: number | undefined): Promise<SettingsNamespaceView> {
+    return await this.callRaw<SettingsNamespaceView>('settings/update', { ns, patch, expectedRevision })
+  }
+
+  /** Credentials describe (Typert `credentials/describe`). */
+  async credentialsDescribe(refs: readonly string[]): Promise<Record<string, CredentialInfo>> {
+    return await this.callRaw<Record<string, CredentialInfo>>('credentials/describe', { refs })
+  }
+
+  /** Credentials set (Typert `credentials/set`). */
+  async credentialsSet(ref: string, value: string): Promise<void> {
+    await this.callRaw<null>('credentials/set', { ref, value })
+  }
+
+  /** Credentials unset (Typert `credentials/unset`). */
+  async credentialsUnset(ref: string): Promise<void> {
+    await this.callRaw<null>('credentials/unset', { ref })
+  }
+
+  /** LLM provider list (Typert `llm/listProviders`). */
+  async llmListProviders(): Promise<readonly LlmProviderInfo[]> {
+    return await this.callRaw<readonly LlmProviderInfo[]>('llm/listProviders', {})
+  }
+
+  /** LLM configurable provider list (Typert `llm/listConfigurableProviders`). */
+  async llmListConfigurableProviders(): Promise<readonly LlmConfigurableProvider[]> {
+    return await this.callRaw<readonly LlmConfigurableProvider[]>('llm/listConfigurableProviders', {})
+  }
+
+  /** LLM model discovery (Typert `llm/discoverModels`). */
+  async llmDiscoverModels(settingsNs: string, request: LlmModelDiscoveryRequest): Promise<readonly LlmDiscoveredModel[]> {
+    return await this.callRaw<readonly LlmDiscoveredModel[]>('llm/discoverModels', { settingsNs, request })
+  }
+
+  /** Host-wide forwarded remote events (the `$events` logical stream). */
+  remoteEvents(signal: AbortSignal): AsyncGenerator<{ readonly event: string; readonly args: readonly unknown[] }> {
+    return this.openStream<{ readonly event: string; readonly args: readonly unknown[] }>('$events', {}, signal)
+  }
+
+  /** Connectivity check: an authenticated unary round-trip. */
+  async probe(): Promise<void> {
+    await this.callRaw<{ readonly blanks: readonly unknown[] }>('session/list', { _request: {} })
+  }
+
+  /** Expands wire history records (chunk rows) back to the exact events. */
+  static expandRecords(records: readonly unknown[]): { readonly event: unknown }[] {
+    const events: { readonly event: unknown }[] = []
+    for (const record of records) {
+      const unwrapped = record as WireRecord
+      if (unwrapped.type === 'event') {
+        events.push({ event: (unwrapped.event as { readonly data?: unknown })['data'] === undefined ? unwrapped.event : { ...unwrapped.event } })
+      } else {
+        const row = unwrapped.event as unknown
+        const stripped = typeof row === 'object' && row !== null && typeof Reflect.get(row, 'type') === 'string'
+          ? { ...(row as Record<string, unknown>), type: String(Reflect.get(row, 'type')).replace(/^chunkrow\//u, '') }
+          : row
+        for (const event of decodeStorageRecord(normalizeChunkRowEnvelope(stripped)) as unknown[]) events.push({ event })
+      }
+    }
+    return events
+  }
+
+  /** Expands follow snapshot records and returns the undecorated event list. */
+  static expandEvents(records: readonly unknown[]): readonly unknown[] {
+    return NodeGatewayClient.expandRecords(records).map((entry) => entry.event)
+  }
+
   private async postImportApi<T>(
     path: string,
     body: unknown,
     parse: (value: unknown) => T,
   ): Promise<T> {
+    await this.ensureAuthenticated()
     const response = await this.doFetch(new URL(path, this.baseUrl), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -105,7 +361,7 @@ export class NodeGatewayClient extends AbstractApiClient {
     }).catch((cause: unknown) => {
       throw timedOutImport(path, this.importTimeoutMs, cause)
     })
-    if (response.status === 404) {
+    if (response.status === 404 || response.status === 405) {
       throw new Error('SESSION_IMPORT_UNAVAILABLE')
     }
     const text = await response.text().catch((cause: unknown) => {
@@ -133,35 +389,106 @@ export class NodeGatewayClient extends AbstractApiClient {
     }
   }
 
-  /**
-   * Generic unary call for endpoints outside the typed RpcMethodMap (the host
-   * commands service is a typert remote, not part of the api-proxy contract).
-   * Mirrors `callUnary`'s envelope lifecycle without the per-method value
-   * schema table; the caller narrows the raw value.
-   */
-  private async callUnaryRaw<T>(method: string, payload: Record<string, unknown>): Promise<T> {
-    const message = {
-      type: 'client-request' as const,
-      rpcId: this.mintRpcId(),
-      method,
-      payload,
-    }
+  /** Generic unary call: Connection envelope POST to `/api/<endpoint>`. */
+  private async callRaw<T>(method: string, args: Record<string, unknown>): Promise<T> {
+    await this.ensureAuthenticated()
+    const started = Date.now()
+    const rpcId = RpcId(`vscode-${Date.now().toString(36)}-${(++this.rpcCounter).toString(36)}`)
+    const message: ClientRequest = { type: 'client-request', rpcId, method, payload: { args } }
     this.onEnvelope(message)
-    const response = await this.doFetch(new URL(`/api/${method}`, this.resolveBase()), {
+    const response = await this.doFetch(new URL(`/api/${method}`, this.baseUrl), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(message),
+      signal: AbortSignal.timeout(this.importTimeoutMs),
     })
-    if (!response.ok) throw new Error(`transport failure for ${method}: HTTP ${response.status}`)
-    const full = serverResponseSchema.parse(await response.json())
+    if (!response.ok) {
+      console.error(`[gateway-rpc] ${method} HTTP ${response.status} after ${Date.now() - started}ms`)
+      throw new Error(`transport failure for ${method}: HTTP ${response.status}`)
+    }
+    const full = serverResponseSchema.parse(await response.json()) as ServerResponse
     this.onEnvelope(full)
-    if (full.rpcId !== message.rpcId) throw new Error(`rpcId mismatch for ${method}: sent ${message.rpcId}, got ${full.rpcId}`)
+    if (full.rpcId !== rpcId) throw new Error(`rpcId mismatch for ${method}: sent ${rpcId}, got ${full.rpcId}`)
     if (!full.result.ok) throw new Error(`RPC ${method} failed: ${full.result.error.code}: ${full.result.error.message}`)
+    if (Date.now() - started > 1_000) console.error(`[gateway-rpc] ${method} took ${Date.now() - started}ms`)
     return full.result.value as T
   }
 
-  protected override resolveBase(): string {
-    return this.baseUrl
+  /** Domain stream: one logical stream on the shared `/api/remote.mux` WebSocket. */
+  private async *openStream<T>(endpoint: string, args: Record<string, unknown>, signal: AbortSignal): AsyncGenerator<T> {
+    await this.ensureAuthenticated()
+    const streamId = `vscode-${Date.now().toString(36)}-${(++this.rpcCounter).toString(36)}`
+    const url = new URL('/api/remote.mux', this.baseUrl)
+    url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
+    const headers: Record<string, string> = { 'content-type': 'application/json' }
+    if (this.cookie !== undefined) headers['cookie'] = this.cookie
+    const socket = new WebSocket(url, { headers })
+    const inbox: QueueItem<T>[] = []
+    let wake: (() => void) | undefined
+    let failure: Error | undefined
+
+    const enqueue = (item: QueueItem<T>): void => {
+      inbox.push(item)
+      wake?.()
+      wake = undefined
+    }
+    const fail = (error: Error): void => {
+      if (failure !== undefined) return
+      failure = error
+      inbox.length = 0
+      wake?.()
+      wake = undefined
+    }
+    const abort = (): void => {
+      if (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN) socket.close()
+    }
+    const message = (data: RawData): void => {
+      try {
+        const frame = JSON.parse(rawDataText(data)) as StreamFrame
+        if (frame.streamId !== streamId) return
+        if (frame.type === 'item') enqueue({ kind: 'item', value: frame.value as T })
+        else if (frame.type === 'end') enqueue({ kind: 'end' })
+        else if (frame.type === 'error') fail(new Error(`stream ${endpoint} failed: ${String(frame.error?.code ?? '')}: ${frame.error?.message ?? ''}`))
+      } catch {
+        // A malformed push is isolated. Generation closes retry the stream.
+      }
+    }
+
+    socket.once('open', () => {
+      socket.send(JSON.stringify({ type: 'open', streamId, endpoint, payload: { args } }))
+    })
+    socket.on('message', message)
+    socket.once('close', () => enqueue({ kind: 'end' }))
+    socket.once('error', (error) => fail(error))
+    signal.addEventListener('abort', abort, { once: true })
+    if (signal.aborted) abort()
+
+    try {
+      while (!signal.aborted) {
+        while (inbox.length > 0) {
+          const item = inbox.shift()
+          if (item?.kind === 'end') return
+          if (item?.kind === 'error') throw (item as { kind: 'error'; error: Error }).error
+          if (item?.kind === 'item') yield (item as { kind: 'item'; value: T }).value
+        }
+        if (failure !== undefined) throw failure
+        await new Promise<void>((resolve) => { wake = resolve })
+      }
+    } finally {
+      signal.removeEventListener('abort', abort)
+      socket.off('message', message)
+      socket.off('close', () => undefined)
+      socket.off('error', () => undefined)
+      if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+        socket.send(JSON.stringify({ type: 'cancel', streamId }))
+        socket.close()
+      }
+    }
+  }
+
+  /** Pre-write hook for the envelope lifecycle (kept for test parity). */
+  protected onEnvelope(_message: ClientRequest | ServerResponse): void {
+    // Transport instrumentation seam.
   }
 
   protected doFetch(input: URL, init?: RequestInit): Promise<Response> {
@@ -171,84 +498,24 @@ export class NodeGatewayClient extends AbstractApiClient {
     // leaving the workbench stuck on "Starting Harness". A bare Agent bypasses
     // the proxy entirely for every request this client makes — the extension
     // only ever talks to the local Gateway over loopback.
+    const headers: Record<string, string> = {}
+    new Headers(init?.headers ?? undefined).forEach((value, key) => { headers[key] = value })
+    if (this.cookie !== undefined && headers['cookie'] === undefined) headers['cookie'] = this.cookie
     const request = init === undefined
-      ? { dispatcher: LOOPBACK_DISPATCHER }
-      : { ...init, dispatcher: LOOPBACK_DISPATCHER }
+      ? { headers, dispatcher: LOOPBACK_DISPATCHER }
+      : { ...init, headers, dispatcher: LOOPBACK_DISPATCHER }
     return undiciFetch(input, request as Parameters<typeof undiciFetch>[1]) as Promise<Response>
   }
+}
 
-  protected override openMux(
-    _payload: Parameters<ApiProxy['events']['mux']>[0]['payload'],
-    signal: AbortSignal,
-    onOpen?: () => void,
-  ): AsyncIterable<RpcRequest<MuxFrame>> {
-    return this.readSocket('/api/events.mux', signal, muxFrameSchema, onOpen)
-  }
+type QueueItem<T> = { readonly kind: 'item'; readonly value: T } | { readonly kind: 'end' } | { readonly kind: 'error'; readonly error: Error }
 
-  protected override openHost(
-    _payload: Parameters<ApiProxy['events']['host']>[0]['payload'],
-    signal: AbortSignal,
-    onOpen?: () => void,
-  ): AsyncIterable<RpcRequest<HostFrame>> {
-    return this.readSocket('/api/events.host', signal, hostFrameSchema, onOpen)
-  }
-
-  private async *readSocket<F extends MuxFrame | HostFrame>(
-    path: string,
-    signal: AbortSignal,
-    parser: FrameParser<F>,
-    onOpen?: () => void,
-  ): AsyncGenerator<RpcRequest<F>> {
-    const url = new URL(path, this.baseUrl)
-    url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
-    const socket = new WebSocket(url)
-    const inbox: SocketItem<F>[] = []
-    let wake: (() => void) | undefined
-
-    const enqueue = (item: SocketItem<F>): void => {
-      inbox.push(item)
-      wake?.()
-      wake = undefined
-    }
-    const close = (): void => { enqueue({ kind: 'end' }) }
-    const abort = (): void => {
-      if (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN) socket.close()
-    }
-    const message = (data: RawData): void => {
-      try {
-        const full: ServerRequest = serverRequestSchema.parse(JSON.parse(rawDataText(data)))
-        const payload = parser.parse(full.payload)
-        this.onEnvelope(full)
-        enqueue({ kind: 'frame', envelope: { rpcId: full.rpcId, payload } })
-      } catch {
-        // A malformed push is isolated. A later history refresh repairs gaps.
-      }
-    }
-
-    socket.once('open', onOpen ?? (() => undefined))
-    socket.on('message', message)
-    socket.once('close', close)
-    socket.once('error', close)
-    signal.addEventListener('abort', abort, { once: true })
-    if (signal.aborted) abort()
-
-    try {
-      while (!signal.aborted) {
-        while (inbox.length > 0) {
-          const item = inbox.shift()
-          if (item?.kind === 'end') return
-          if (item?.kind === 'frame') yield item.envelope
-        }
-        await new Promise<void>((resolve) => { wake = resolve })
-      }
-    } finally {
-      signal.removeEventListener('abort', abort)
-      socket.off('message', message)
-      socket.off('close', close)
-      socket.off('error', close)
-      abort()
-    }
-  }
+/** Wire frames accepted on `/api/remote.mux`. */
+interface StreamFrame {
+  readonly type: 'open' | 'item' | 'end' | 'error' | 'cancel'
+  readonly streamId: string
+  readonly value?: unknown
+  readonly error?: { readonly code: string; readonly message: string; readonly details: object }
 }
 
 function timedOutImport(path: string, timeoutMs: number, cause: unknown): Error {
@@ -266,4 +533,27 @@ function rawDataText(data: RawData): string {
   if (data instanceof ArrayBuffer) return Buffer.from(data).toString('utf8')
   if (Array.isArray(data)) return Buffer.concat(data).toString('utf8')
   return data.toString('utf8')
+}
+
+/**
+ * The follow wire encodes chunk rows as chunkrow/* records carrying seq and
+ * time, while the storage decoder (@deepseek-ai/dsh-session chunk-rows)
+ * validates the exact {type, seq0, time0, data} envelope and throws on any
+ * deviation. Remap the wire keys (and drop the originals) so decoded chunk
+ * runs survive; without this the follow snapshot crashed and history
+ * sessions rendered no conversation.
+ */
+function normalizeChunkRowEnvelope(row: unknown): unknown {
+  if (typeof row !== 'object' || row === null) return row
+  const record = row as Record<string, unknown>
+  const type = typeof record.type === 'string' ? record.type : ''
+  if (type !== 'text-chunks' && type !== 'reasoning-chunks' && type !== 'tool-call-chunks') return row
+  if (!(typeof record.seq === 'number' && typeof record.time === 'number')) return row
+  const envelope: Record<string, unknown> = {}
+  for (const key of Object.keys(record)) {
+    if (key !== 'seq' && key !== 'time') envelope[key] = record[key]
+  }
+  envelope.seq0 = record.seq
+  envelope.time0 = record.time
+  return envelope
 }

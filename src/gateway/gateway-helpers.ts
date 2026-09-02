@@ -4,8 +4,8 @@
  * state, no client access.
  */
 import * as vscode from 'vscode'
-import type { ClientResponse, HistoryEntry, QueuedInboxItem, RpcId, RpcResponse, SubagentListEntry } from '@deepseek-ai/dsh-client-connection/client'
-import type { PromptContentPart } from '@deepseek-ai/dsh-host-apiproxy/api'
+import type { HistoryEntry, QueuedInboxItem, SubagentListEntry } from './gateway-wire.js'
+import type { PromptContentPart } from './gateway-wire.js'
 import type { PromptAttachment } from '../domain/prompt-context.js'
 import type {
   PendingApprovalView,
@@ -24,6 +24,26 @@ export function lastAssistantSeq(entries: readonly HistoryEntry[]): number | und
     }
   }
   return undefined
+}
+
+/**
+ * The event seq of the last assistant message belonging to one turn.
+ * Scoping by turn keeps the recorded conclusion id correct even when another
+ * turn has produced later assistant messages (or when streamed history is
+ * replayed out of order after a runtime upgrade).
+ */
+export function lastAssistantSeqForTurn(
+  entries: readonly HistoryEntry[],
+  turn: number,
+): number | undefined {
+  let latest: number | undefined
+  for (const { event } of entries) {
+    if (event?.type !== 'assistant/message') continue
+    const data = event.data as { readonly turn?: unknown } | undefined
+    if (data?.turn !== turn) continue
+    if (typeof event.seq === 'number' && (latest === undefined || event.seq > latest)) latest = event.seq
+  }
+  return latest
 }
 
 export function attachmentPart(attachment: PromptAttachment): PromptContentPart {
@@ -50,17 +70,9 @@ export function attachmentPart(attachment: PromptAttachment): PromptContentPart 
   }
 }
 
-export function valueOf<T>(response: RpcResponse<T>): T {
+export function valueOf<T>(response: { readonly result: { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: { readonly message: string } } }): T {
   if (!response.result.ok) throw new Error(response.result.error.message)
   return response.result.value
-}
-
-export function stripApprovalTransport(value: PendingApprovalView & { readonly rpcId: unknown; readonly approvalId: unknown }): PendingApprovalView {
-  return {
-    key: value.key,
-    toolName: value.toolName,
-    ...(value.reason === undefined ? {} : { reason: value.reason }),
-  }
 }
 
 export function stripQuestionTransport(value: PendingQuestionView & { readonly rpcId: unknown }): PendingQuestionView {
@@ -69,15 +81,16 @@ export function stripQuestionTransport(value: PendingQuestionView & { readonly r
 
 /** Reduces one pending inbox item to the small, webview-friendly queue view. */
 export function queuedPromptView(item: QueuedInboxItem): QueuedPromptView {
-  const text = item.message.content
-    .filter((block): block is { readonly type: 'text'; readonly text: string } => block.type === 'text')
-    .map((block) => block.text)
-    .join('\n')
+  const blocks = item.message.content.map((block) => {
+    const record = typeof block === 'object' && block !== null ? block as Record<string, unknown> : undefined
+    return { type: typeof record?.type === 'string' ? record.type : '', text: typeof record?.text === 'string' ? record.text : '' }
+  })
+  const text = blocks.filter((block) => block.type === 'text').map((block) => block.text).join('\n')
   return {
     id: String(item.id),
     placement: item.placement,
     text,
-    hasMedia: item.message.content.some((block) => block.type === 'image'),
+    hasMedia: blocks.some((block) => block.type === 'image'),
   }
 }
 
@@ -150,7 +163,3 @@ export function localizedWorkbenchLabels(): WorkbenchLabels {
   }
 }
 
-/** Builds a client-response message for one outstanding RPC. */
-export function respondMessage(rpcId: RpcId, value: unknown): ClientResponse {
-  return { type: 'client-response', rpcId, result: { ok: true, value } }
-}

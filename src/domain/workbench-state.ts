@@ -1,12 +1,8 @@
-import type {
-  AgentPresetEntry,
-  JobView,
-  ModelReasoningEffort,
-  SessionSummary,
-  SkillEntry,
-} from '@deepseek-ai/dsh-host-apiproxy/api'
-import type { HistoryEntry } from '@deepseek-ai/dsh-host-apiproxy/api'
+import type { HistoryEntry, JobView, SessionSummary, SkillEntry } from '../gateway/gateway-wire.js'
+import type { AgentPresetRow as AgentPresetEntry } from '@deepseek-ai/dsh-agent-presets/types'
+import type { ModelReasoningEffort } from '@deepseek-ai/dsh-api-session-controller/types'
 import type {} from '@deepseek-ai/dsh-commands/types'
+import type {} from '@deepseek-ai/dsh-tool-todo'
 import type { ContextPressureView } from './context-pressure.js'
 import type { EffortIntent } from './session-effort.js'
 import type { SessionChangesView } from './session-changes.js'

@@ -267,8 +267,8 @@ describe('ConnectionSettingsService', () => {
 
     // Simulate a stale-revision write: the profile deletion is refused before
     // the credential is ever touched.
-    const settings = harness.client.settings as { mutate: () => Promise<unknown> }
-    settings.mutate = () => Promise.resolve({ rpcId: 'test', result: { ok: false, error: { message: 'settings-conflict' } } })
+    const settings = harness.client as { settingsMutate: () => Promise<unknown> }
+    settings.settingsMutate = () => Promise.reject(new Error('settings-conflict'))
 
     await expect(service.remove('packycode')).rejects.toThrow('settings-conflict')
     expect(harness.document.credentials.PROVIDER_PACKYCODE_API_KEY).toBe('stored-secret')
@@ -359,61 +359,62 @@ function fakeHarness(
     ],
   })
   const client = {
-    settings: {
-      describe: () => ok(describeSettings()),
-      mutate: (payload: { ns: string; ops: { op: 'set' | 'unset'; path: string[]; value?: unknown }[] }) => {
-        const section = payload.ns === 'llm-pi-ai' ? document.piAi : document.deepseek
-        for (const op of payload.ops) {
-          mutate(section.value, op.path, op.op, op.value)
-          mutate(section.user, op.path, op.op, op.value)
-        }
-        section.revision += 1
-        return ok(describeSettings().namespaces.find((item) => item.ns === payload.ns))
-      },
+    settingsDescribe: () => Promise.resolve(describeSettings() as never),
+    settingsMutate: (ns: string, ops: { op: 'set' | 'unset'; path: string[]; value?: unknown }[], expectedRevision?: number) => {
+      const section = ns === 'llm-pi-ai' ? document.piAi : document.deepseek
+      for (const op of ops) {
+        mutate(section.value, op.path, op.op, op.value)
+        mutate(section.user, op.path, op.op, op.value)
+      }
+      section.revision += 1
+      return Promise.resolve(describeSettings().namespaces.find((item) => item.ns === ns) as never)
     },
-    credentials: {
-      describe: ({ refs }: { refs: string[] }) => ok({
-        credentials: Object.fromEntries(refs.map((ref) => [ref, {
-          configured: document.credentials[ref] !== undefined,
-          writable: true,
-          ...(document.credentials[ref] === undefined ? {} : { source: 'file' }),
-        }])),
-      }),
-      set: ({ ref, value }: { ref: string; value: string }) => {
-        document.credentials[ref] = value
-        return ok({})
-      },
-      unset: ({ ref }: { ref: string }) => {
-        delete document.credentials[ref]
-        return ok({})
-      },
+    credentialsDescribe: (refs: readonly string[]) => Promise.resolve(Object.fromEntries(refs.map((ref) => [ref, {
+      configured: document.credentials[ref] !== undefined,
+      writable: true,
+      ...(document.credentials[ref] === undefined ? {} : { source: 'file' }),
+    }])) as never),
+    credentialsSet: (ref: string, value: string) => {
+      document.credentials[ref] = value
+      return Promise.resolve() as never
     },
-    llm: {
-      providers: () => ok({ providers: [
-        { provider: 'deepseek-official', displayName: 'DeepSeek Official', settingsNs: 'llm-deepseek', settingsPath: [], active: true },
-        ...Object.entries(document.piAi.value.providers).map(([provider, profile]) => ({
-          provider,
-          displayName: String(profile.displayName ?? provider),
-          settingsNs: 'llm-pi-ai',
-          settingsPath: ['providers', provider],
-          active: true,
-          declared: true,
+    credentialsUnset: (ref: string) => {
+      delete document.credentials[ref]
+      return Promise.resolve() as never
+    },
+    llmListProviders: () => Promise.resolve([
+      { id: 'deepseek-official', name: 'DeepSeek Official' },
+      ...Object.entries(document.piAi.value.providers).map(([provider, profile]) => ({
+        id: provider,
+        name: String((profile as { displayName?: unknown }).displayName ?? provider),
+      })),
+    ] as never),
+    llmListConfigurableProviders: () => Promise.resolve([
+      { provider: 'deepseek-official', displayName: 'DeepSeek Official', settingsNs: 'llm-deepseek', settingsPath: [] },
+      ...Object.entries(document.piAi.value.providers).map(([provider, profile]) => ({
+        provider,
+        displayName: String((profile as { displayName?: unknown }).displayName ?? provider),
+        settingsNs: 'llm-pi-ai',
+        settingsPath: ['providers', provider],
+        declared: true,
+      })),
+    ] as never),
+    sessionModelCatalog: () => Promise.resolve({
+      default: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
+      routableProviders: ['deepseek-official'],
+      groups: [
+        { id: 'deepseek-official', name: 'DeepSeek Official', models: deepSeekModels() },
+        ...Object.entries(document.piAi.value.providers).map(([id, profile]) => ({
+          id,
+          name: id,
+          models: Array.isArray((profile as { models?: unknown }).models)
+            ? ((profile as { models: unknown[] }).models).map((model) => ({ id: String((model as { id?: unknown })?.id ?? ''), name: id }))
+            : deepSeekModels(),
         })),
-      ] }),
-      models: () => ok({
-        groups: [
-          { id: 'deepseek-official', name: 'DeepSeek Official', models: deepSeekModels() },
-          ...Object.entries(document.piAi.value.providers).map(([id, profile]) => ({
-            id,
-            name: id,
-            models: Array.isArray(profile.models)
-              ? profile.models.map((model) => ({ id: String((model as { id?: unknown })?.id ?? ''), name: id }))
-              : deepSeekModels(),
-          })),
-        ],
-        failures: [],
-      }),
-    },
+      ],
+      failures: [],
+    } as never),
+    llmDiscoverModels: () => Promise.resolve([] as never),
   }
   return { document, client }
 }

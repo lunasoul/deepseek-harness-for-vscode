@@ -4,7 +4,7 @@
  * already-updated profile is a no-op — and each grows the wire state written
  * by older builds toward the shape this extension reads today.
  */
-import type { SettingsPathOpView } from '@deepseek-ai/dsh-host-apiproxy/api'
+import type { SettingsPathOpView } from '@deepseek-ai/dsh-settings/types'
 import type { ConfigurationService } from '../../config/configuration.js'
 import { modelCapacity } from '../../domain/model-capacity.js'
 import { supportsImageInput } from '../../domain/model-modalities.js'
@@ -46,7 +46,7 @@ export async function runMigrations(context: MigrationContext): Promise<void> {
  */
 async function migrateLegacySettings(context: MigrationContext): Promise<void> {
   const { client, configuration, legacyCredentials } = context
-  const described = valueOf(await client.settings.describe({}))
+  const described = await client.settingsDescribe()
   if (!described.writable) return
   const piAi = described.namespaces.find((item) => item.ns === PI_AI_SETTINGS_NS)
   const deepSeek = described.namespaces.find((item) => item.ns === DEEPSEEK_SETTINGS_NS)
@@ -72,41 +72,38 @@ async function migrateLegacySettings(context: MigrationContext): Promise<void> {
     const refs = [...new Set(candidates.map((candidate) => candidate.ref))]
     const credentialState = refs.length === 0
       ? { credentials: {} }
-      : valueOf(await client.credentials.describe({ refs }))
+      : await client.credentialsDescribe(refs)
     for (const candidate of candidates) {
       if (candidate.existing === undefined) {
         ops.push({
           op: 'set',
           path: ['providers', candidate.route],
-          value: deepSeekRelayProfile(candidate.provider.name, candidate.provider.baseUrl, candidate.ref),
+          value: deepSeekRelayProfile(candidate.provider.name, candidate.provider.baseUrl, candidate.ref) as import('@deepseek-ai/dsh-util-values').JsonValue,
         })
       }
-      if (candidate.provider.apiKey.trim() !== '' && credentialState.credentials[candidate.ref]?.configured !== true) {
+      const credentialInfo = (await client.credentialsDescribe([candidate.ref]))[candidate.ref]
+      if (candidate.provider.apiKey.trim() !== '' && credentialInfo?.configured !== true) {
         pendingCredentials.push({ ref: candidate.ref, value: candidate.provider.apiKey })
       }
     }
     if (ops.length > 0) {
-      valueOf(await client.settings.mutate({ ns: PI_AI_SETTINGS_NS, ops, expectedRevision: piAi.revision }))
+      await client.settingsMutate(PI_AI_SETTINGS_NS, ops, piAi.revision)
     }
     for (const credential of pendingCredentials) {
-      valueOf(await client.credentials.set(credential))
+      await client.credentialsSet(credential.ref, credential.value)
     }
   } else if (legacyRelay !== undefined) {
     throw new Error('Harness cannot migrate the legacy relay because llm-pi-ai is unavailable.')
   }
 
   if (legacyRelay === undefined && legacyKey !== undefined && legacyKey.trim() !== '') {
-    const status = valueOf(await client.credentials.describe({ refs: ['DEEPSEEK_API_KEY'] }))
-    if (status.credentials.DEEPSEEK_API_KEY?.configured !== true) {
-      valueOf(await client.credentials.set({ ref: 'DEEPSEEK_API_KEY', value: legacyKey.trim() }))
+    const status = await client.credentialsDescribe(['DEEPSEEK_API_KEY'])
+    if (status['DEEPSEEK_API_KEY']?.configured !== true) {
+      await client.credentialsSet('DEEPSEEK_API_KEY', legacyKey.trim())
     }
   }
   if (deepSeek !== undefined && legacyBaseUrl !== undefined && legacyRelay === undefined && valueAt(deepSeek.user, ['baseURL']) === undefined) {
-    valueOf(await client.settings.mutate({
-      ns: DEEPSEEK_SETTINGS_NS,
-      ops: [{ op: 'set', path: ['baseURL'], value: legacyBaseUrl }],
-      expectedRevision: deepSeek.revision,
-    }))
+    await client.settingsMutate(DEEPSEEK_SETTINGS_NS, [{ op: 'set', path: ['baseURL'], value: legacyBaseUrl }], deepSeek.revision)
   }
   if (legacyRelay !== undefined && configuration.get().provider === DEEPSEEK_OFFICIAL_PROVIDER) {
     await configuration.setProvider(legacyRelay.route)
@@ -126,7 +123,7 @@ async function migrateLegacySettings(context: MigrationContext): Promise<void> {
  */
 async function migrateRelayReasoningEfforts(context: MigrationContext): Promise<void> {
   const client = context.client
-  const described = valueOf(await client.settings.describe({}))
+  const described = await client.settingsDescribe()
   if (!described.writable) return
   const piAi = described.namespaces.find((item) => item.ns === PI_AI_SETTINGS_NS)
   if (piAi === undefined) return
@@ -153,7 +150,7 @@ async function migrateRelayReasoningEfforts(context: MigrationContext): Promise<
     if (changed) ops.push({ op: 'set', path: ['providers', route, 'models'], value: upgraded })
   }
   if (ops.length === 0) return
-  valueOf(await client.settings.mutate({ ns: PI_AI_SETTINGS_NS, ops, expectedRevision: piAi.revision }))
+  await client.settingsMutate(PI_AI_SETTINGS_NS, ops, piAi.revision)
 }
 
 /**
@@ -166,7 +163,7 @@ async function migrateRelayReasoningEfforts(context: MigrationContext): Promise<
  */
 async function migrateRelayCapacities(context: MigrationContext): Promise<void> {
   const client = context.client
-  const described = valueOf(await client.settings.describe({}))
+  const described = await client.settingsDescribe()
   if (!described.writable) return
   const piAi = described.namespaces.find((item) => item.ns === PI_AI_SETTINGS_NS)
   if (piAi === undefined) return
@@ -194,7 +191,7 @@ async function migrateRelayCapacities(context: MigrationContext): Promise<void> 
     if (changed) ops.push({ op: 'set', path: ['providers', route, 'models'], value: upgraded })
   }
   if (ops.length === 0) return
-  valueOf(await client.settings.mutate({ ns: PI_AI_SETTINGS_NS, ops, expectedRevision: piAi.revision }))
+  await client.settingsMutate(PI_AI_SETTINGS_NS, ops, piAi.revision)
 }
 
 /**
@@ -206,7 +203,7 @@ async function migrateRelayCapacities(context: MigrationContext): Promise<void> 
  */
 async function migrateRelayImageModalities(context: MigrationContext): Promise<void> {
   const client = context.client
-  const described = valueOf(await client.settings.describe({}))
+  const described = await client.settingsDescribe()
   if (!described.writable) return
   const piAi = described.namespaces.find((item) => item.ns === PI_AI_SETTINGS_NS)
   if (piAi === undefined) return
@@ -231,5 +228,5 @@ async function migrateRelayImageModalities(context: MigrationContext): Promise<v
     if (changed) ops.push({ op: 'set', path: ['providers', route, 'models'], value: upgraded })
   }
   if (ops.length === 0) return
-  valueOf(await client.settings.mutate({ ns: PI_AI_SETTINGS_NS, ops, expectedRevision: piAi.revision }))
+  await client.settingsMutate(PI_AI_SETTINGS_NS, ops, piAi.revision)
 }

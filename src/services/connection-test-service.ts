@@ -1,10 +1,9 @@
-import type { IApiClient } from '@deepseek-ai/dsh-client-connection/client'
 import type { ConnectionSettingsInput, ConnectionTestResult } from '../domain/connection-settings.js'
 import { validateBaseUrl } from '../domain/base-url.js'
 import { DEEPSEEK_OFFICIAL_PROVIDER } from '../domain/provider.js'
 import { PI_AI_SETTINGS_NS } from './connection-settings-service.js'
 
-type ProviderControlClient = Pick<IApiClient, 'llm'>
+type ProviderControlClient = Pick<import('../gateway/node-gateway-client.js').NodeGatewayClient, 'llmDiscoverModels'>
 
 /** Uses DSH's upstream GET /models discovery path; it never creates a completion. */
 export class ConnectionTestService {
@@ -19,21 +18,19 @@ export class ConnectionTestService {
       return { status: 'unreachable', detail: 'The Base URL must be a valid http(s) URL.' }
     }
     try {
-      const response = await this.client().llm.discoverModels({
-        settingsNs: PI_AI_SETTINGS_NS,
+      const models = await this.client().llmDiscoverModels(PI_AI_SETTINGS_NS, {
         ...(input.provider === '__new__' ? {} : { provider: input.provider }),
         baseURL,
         api: 'openai-completions',
         ...(input.apiKey.trim() === '' ? {} : { apiKey: input.apiKey.trim() }),
       })
-      if (!response.result.ok) return { status: 'unreachable', detail: response.result.error.message }
-      if (response.result.value.models.length === 0) {
+      if (models.length === 0) {
         return { status: 'unreachable', detail: 'The endpoint returned an empty model catalog.' }
       }
       return {
         status: 'success',
-        modelCount: response.result.value.models.length,
-        models: response.result.value.models.map((model) => ({
+        modelCount: models.length,
+        models: models.map((model) => ({
           id: model.id,
           ...(model.contextWindow === undefined ? {} : { contextWindow: model.contextWindow }),
           ...(model.maxTokens === undefined ? {} : { maxTokens: model.maxTokens }),

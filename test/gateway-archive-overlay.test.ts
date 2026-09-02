@@ -45,21 +45,22 @@ function stubWorktreeService(): WorktreeService {
  */
 
 interface TestClient {
-  workspace: {
-    list: ReturnType<typeof vi.fn>
-    archiveSession: ReturnType<typeof vi.fn>
-  }
-  sessions: {
-    list: ReturnType<typeof vi.fn>
-    history: ReturnType<typeof vi.fn>
-    models: ReturnType<typeof vi.fn>
-    create: ReturnType<typeof vi.fn>
-    selectModel: ReturnType<typeof vi.fn>
-  }
-  skills: { list: ReturnType<typeof vi.fn> }
-  subagents: { list: ReturnType<typeof vi.fn> }
-  agentPresets: { list: ReturnType<typeof vi.fn> }
-  host: { describe: ReturnType<typeof vi.fn> }
+  probe: ReturnType<typeof vi.fn>
+  workspaceArchiveSession: ReturnType<typeof vi.fn>
+  sessionList: ReturnType<typeof vi.fn>
+  sessionCreate: ReturnType<typeof vi.fn>
+  sessionSelectModel: ReturnType<typeof vi.fn>
+  sessionPrompt: ReturnType<typeof vi.fn>
+  sessionModelCatalog: ReturnType<typeof vi.fn>
+  sessionFollow: ReturnType<typeof vi.fn>
+  sessionControl: ReturnType<typeof vi.fn>
+  workspaceFollow: ReturnType<typeof vi.fn>
+  remoteEvents: ReturnType<typeof vi.fn>
+  skillList: ReturnType<typeof vi.fn>
+  subagentList: ReturnType<typeof vi.fn>
+  agentPresetList: ReturnType<typeof vi.fn>
+  listCommands: ReturnType<typeof vi.fn>
+  executeCommand: ReturnType<typeof vi.fn>
 }
 
 function createService(options: {
@@ -68,21 +69,22 @@ function createService(options: {
   client?: TestClient
 } = {}): { service: GatewayTestHarness; client: TestClient } {
   const client = options.client ?? ({} as TestClient)
-  client.workspace ??= {
-    list: vi.fn(),
-    archiveSession: vi.fn(),
-  }
-  client.sessions ??= {
-    list: vi.fn().mockResolvedValue({ result: { ok: true, value: { items: [] } } }),
-    history: vi.fn().mockResolvedValue({ result: { ok: true, value: { events: [], hasMore: false } } }),
-    models: vi.fn().mockResolvedValue({ result: { ok: true, value: { current: {}, groups: [] } } }),
-    create: vi.fn(),
-    selectModel: vi.fn().mockResolvedValue({ result: { ok: true, value: { selected: {} } } }),
-  }
-  client.skills ??= { list: vi.fn().mockResolvedValue({ result: { ok: true, value: { skills: [] } } }) }
-  client.subagents ??= { list: vi.fn().mockResolvedValue({ result: { ok: true, value: { entries: [] } } }) }
-  client.agentPresets ??= { list: vi.fn().mockResolvedValue({ result: { ok: true, value: { presets: [] } } }) }
-  client.host ??= { describe: vi.fn().mockResolvedValue({ result: { ok: true, value: {} } }) }
+  client.probe ??= vi.fn()
+  client.workspaceArchiveSession ??= vi.fn().mockResolvedValue({ archivedSessionIds: [] })
+  client.sessionList ??= vi.fn().mockResolvedValue([])
+  client.sessionCreate ??= vi.fn().mockResolvedValue({ sessionId: 's2', agentPreset: 'standard' })
+  client.sessionSelectModel ??= vi.fn().mockResolvedValue({ selected: { provider: 'deepseek-official', model: 'deepseek-v4-flash' } })
+  client.sessionPrompt ??= vi.fn().mockResolvedValue({ accepted: true })
+  client.sessionModelCatalog ??= vi.fn().mockResolvedValue({ default: { provider: 'deepseek-official', model: 'deepseek-v4-flash' }, routableProviders: [], groups: [], failures: [] })
+  client.sessionFollow ??= vi.fn()
+  client.sessionControl ??= vi.fn()
+  client.workspaceFollow ??= vi.fn()
+  client.remoteEvents ??= vi.fn()
+  client.skillList ??= vi.fn().mockResolvedValue({ skills: [] })
+  client.subagentList ??= vi.fn().mockResolvedValue({ entries: [], parentAvailable: true })
+  client.agentPresetList ??= vi.fn().mockResolvedValue({ presets: [], authorable: false })
+  client.listCommands ??= vi.fn().mockResolvedValue([])
+  client.executeCommand ??= vi.fn().mockResolvedValue(undefined)
 
   const runtime = {
     onDidChangeState: () => ({ dispose: () => {} }),
@@ -146,31 +148,29 @@ interface GatewayTestHarness {
     archive: (id: string, exists: (id: string) => boolean) => Promise<void>
   }
   activeSessionId: string | undefined
+  archivedFromHost: readonly string[] | undefined
+  handleWorkspace: (frame: unknown) => void
   globalState: { get: (key: string) => unknown; update: (key: string, value: unknown) => Promise<void> }
   fireChange: () => void
 }
 
 describe('HarnessGatewayService archive overlay', () => {
-  it('discards a stale workspace.list response after a host archive frame advanced the revision', async () => {
-    const { service, client } = createService({ archived: [] })
+  it('applies the host archive baseline from a workspace/follow frame and keeps it across refresh', async () => {
+    const { service } = createService({ archived: [] })
     service.archives.archivedIds = new Set()
 
-    // Simulate refreshArchiveSet issuing workspace.list (revision captured),
-    // then a host frame updating the set before the RPC settles.
-    client.workspace.list.mockImplementation(async () => {
-      service.archives.install(['a'], true) // host frame wins
-      return { result: { ok: true, value: { archivedSessionIds: [] } } }
-    })
+    // The workspace follow baseline is authoritative: the session is archived
+    // immediately, and a later refresh (reading the same host snapshot) keeps it.
+    service.handleWorkspace({ type: 'baseline', value: { archivedSessionIds: ['a'] } })
     await service.archives.refresh()
 
-    // The stale [] response must not clobber the host's ['a'].
     expect(service.archives.isArchived('a')).toBe(true)
     expect(service.archives.archivedIds.has('a')).toBe(true)
   })
 
-  it('applies a workspace.list response that is still current', async () => {
-    const { service, client } = createService({ archived: [] })
-    client.workspace.list.mockResolvedValue({ result: { ok: true, value: { archivedSessionIds: ['b'] } } })
+  it('applies an archived increment and then refreshes from the host snapshot', async () => {
+    const { service } = createService({ archived: [] })
+    service.handleWorkspace({ type: 'archived', archivedSessionIds: ['b'] })
     await service.archives.refresh()
     expect(service.archives.archivedIds.has('b')).toBe(true)
     expect(service.archives.baselineLoaded).toBe(true)
@@ -179,7 +179,7 @@ describe('HarnessGatewayService archive overlay', () => {
   it('restores the exact overlay snapshot when archiveSession persistence fails', async () => {
     const { service, client } = createService({ archived: [], restored: ['keep'] })
     service.summaries.set('target', { blank: false })
-    client.workspace.archiveSession.mockResolvedValue({ result: { ok: true, value: { archivedSessionIds: ['target'] } } })
+    client.workspaceArchiveSession.mockResolvedValue({ archivedSessionIds: ['target'] })
     // Force the persist step to fail after the RPC succeeded.
     service.globalState.update = async () => { throw new Error('disk full') }
 
@@ -212,11 +212,11 @@ describe('HarnessGatewayService archive overlay', () => {
   it('archives a blank draft so unwanted new-conversation stubs can be hidden', async () => {
     const { service, client } = createService({ archived: [] })
     service.summaries.set('blank-draft', { blank: true })
-    client.workspace.archiveSession.mockResolvedValue({ result: { ok: true, value: { archivedSessionIds: ['blank-draft'] } } })
+    client.workspaceArchiveSession.mockResolvedValue({ archivedSessionIds: ['blank-draft'] })
 
     await service.archives.archive('blank-draft', (id) => service.summaries.has(id))
 
-    expect(client.workspace.archiveSession).toHaveBeenCalledWith({ sessionId: 'blank-draft' })
+    expect(client.workspaceArchiveSession).toHaveBeenCalledWith({ sessionId: 'blank-draft' })
     expect(service.archives.isArchived('blank-draft')).toBe(true)
   })
 })

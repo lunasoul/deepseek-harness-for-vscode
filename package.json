@@ -31,14 +31,16 @@
   "l10n": "./l10n",
   "scripts": {
     "patch:dsh-pi-ai": "node scripts/patch-dsh-llm-pi-ai.mjs",
-    "postinstall": "npm run patch:dsh-pi-ai",
-    "check-types": "npm run patch:dsh-pi-ai && tsc --noEmit",
+    "patch:dsh-projcache": "node scripts/patch-dsh-session-projection-cache.mjs",
+    "patch:dsh": "npm run patch:dsh-pi-ai && npm run patch:dsh-projcache",
+    "postinstall": "npm run patch:dsh",
+    "check-types": "npm run patch:dsh && tsc --noEmit",
     "compile": "npm run check-types && node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
     "lint": "eslint .",
-    "pretest": "npm run patch:dsh-pi-ai",
+    "pretest": "npm run patch:dsh",
     "test": "vitest run",
-    "pretest:watch": "npm run patch:dsh-pi-ai",
+    "pretest:watch": "npm run patch:dsh",
     "test:watch": "vitest",
     "package": "npm run check-types && npm run test && node esbuild.mjs --production && node scripts/package-vsix.mjs",
     "vscode:prepublish": "npm run check-types && node esbuild.mjs --production"
@@ -242,7 +244,7 @@
     "vitest": "^4.0.0"
   },
   "dependencies": {
-    "@deepseek-ai/dsh": "^0.1.1-rc.2",
+    "@deepseek-ai/dsh": "^0.1.2-alpha.4",
     "dompurify": "3.4.13",
     "highlight.js": "^11.12.0",
     "markdown-it": "15.0.0",
@@ -253,7 +255,6 @@
   },
   "allowScripts": {
     "node@22.22.3": true,
-    "@deepseek-ai/dsh-subprocess-local@0.1.1-rc.2": true,
     "esbuild@0.25.12": true,
     "node-pty@1.2.0-beta.15": true,
     "koffi@3.1.5": true,

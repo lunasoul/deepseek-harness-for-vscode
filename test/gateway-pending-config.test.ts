@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
-import type { MuxFrame, RpcId } from '@deepseek-ai/dsh-client-connection/client'
-import type { HostFrame } from '@deepseek-ai/dsh-client-connection/client'
+import type { RpcId } from '@deepseek-ai/dsh-client-connection'
+import type { ControlFrame, FollowFrame } from '../src/gateway/gateway-wire.js'
+
 
 vi.mock('vscode', () => ({
   EventEmitter: class {
@@ -26,20 +27,34 @@ import type { WorktreeService } from '../src/editor/worktree-service.js'
 import type { Memento, OutputChannel } from 'vscode'
 
 interface TestClient {
-  workspace: { list: ReturnType<typeof vi.fn>; archiveSession: ReturnType<typeof vi.fn> }
-  sessions: {
-    list: ReturnType<typeof vi.fn>
-    history: ReturnType<typeof vi.fn>
-    models: ReturnType<typeof vi.fn>
-    create: ReturnType<typeof vi.fn>
-    selectModel: ReturnType<typeof vi.fn>
-    prompt: ReturnType<typeof vi.fn>
-    updateQueue: ReturnType<typeof vi.fn>
-  }
-  skills: { list: ReturnType<typeof vi.fn> }
-  subagents: { list: ReturnType<typeof vi.fn> }
-  agentPresets: { list: ReturnType<typeof vi.fn> }
-  host: { describe: ReturnType<typeof vi.fn> }
+  probe: ReturnType<typeof vi.fn>
+  sessionList: ReturnType<typeof vi.fn>
+  sessionCreate: ReturnType<typeof vi.fn>
+  sessionSelectModel: ReturnType<typeof vi.fn>
+  sessionPrompt: ReturnType<typeof vi.fn>
+  sessionUpdateQueue: ReturnType<typeof vi.fn>
+  sessionCancel: ReturnType<typeof vi.fn>
+  sessionRename: ReturnType<typeof vi.fn>
+  sessionFork: ReturnType<typeof vi.fn>
+  sessionSearch: ReturnType<typeof vi.fn>
+  sessionModelCatalog: ReturnType<typeof vi.fn>
+  sessionPage: ReturnType<typeof vi.fn>
+  sessionFollow: ReturnType<typeof vi.fn>
+  sessionControl: ReturnType<typeof vi.fn>
+  skillList: ReturnType<typeof vi.fn>
+  subagentList: ReturnType<typeof vi.fn>
+  subagentPrompt: ReturnType<typeof vi.fn>
+  subagentInterrupt: ReturnType<typeof vi.fn>
+  agentPresetList: ReturnType<typeof vi.fn>
+  agentPresetSelect: ReturnType<typeof vi.fn>
+  workspaceArchiveSession: ReturnType<typeof vi.fn>
+  workspaceFollow: ReturnType<typeof vi.fn>
+  remoteEvents: ReturnType<typeof vi.fn>
+  resolveRemoteEvent: ReturnType<typeof vi.fn>
+  goalCreate: ReturnType<typeof vi.fn>
+  goalAction: ReturnType<typeof vi.fn>
+  listCommands: ReturnType<typeof vi.fn>
+  executeCommand: ReturnType<typeof vi.fn>
 }
 
 const CONFIG = {
@@ -49,22 +64,36 @@ const CONFIG = {
   agentPreset: 'standard',
 }
 
-function createService(configOverride: Record<string, unknown> = {}): { service: GatewayTestHarness; client: TestClient; persist: ReturnType<typeof vi.fn>; worktrees: Record<string, ReturnType<typeof vi.fn>> } {
+function createService(configOverride: Record<string, unknown> = {}): { service: GatewayTestHarness; client: TestClient; persist: ReturnType<typeof vi.fn>; worktrees: Record<string, ReturnType<typeof vi.fn>>; runtime: { start: ReturnType<typeof vi.fn>; stop: ReturnType<typeof vi.fn> } } {
   const client: TestClient = {
-    workspace: { list: vi.fn(), archiveSession: vi.fn() },
-    sessions: {
-      list: vi.fn().mockResolvedValue({ result: { ok: true, value: { items: [] } } }),
-      history: vi.fn().mockResolvedValue({ result: { ok: true, value: { events: [], hasMore: false } } }),
-      models: vi.fn().mockResolvedValue({ result: { ok: true, value: { current: {}, groups: [] } } }),
-      create: vi.fn().mockResolvedValue({ result: { ok: true, value: { sessionId: 's2', agentPreset: 'code' } } }),
-      selectModel: vi.fn().mockResolvedValue({ result: { ok: true, value: { selected: {} } } }),
-      prompt: vi.fn().mockResolvedValue({ result: { ok: true, value: { accepted: true } } }),
-      updateQueue: vi.fn().mockResolvedValue({ result: { ok: true, value: { accepted: true } } }),
-    },
-    skills: { list: vi.fn().mockResolvedValue({ result: { ok: true, value: { skills: [] } } }) },
-    subagents: { list: vi.fn().mockResolvedValue({ result: { ok: true, value: { entries: [] } } }) },
-    agentPresets: { list: vi.fn().mockResolvedValue({ result: { ok: true, value: { presets: [] } } }) },
-    host: { describe: vi.fn().mockResolvedValue({ result: { ok: true, value: {} } }) },
+    probe: vi.fn(),
+    sessionList: vi.fn().mockResolvedValue([]),
+    sessionCreate: vi.fn().mockResolvedValue({ sessionId: 's2', agentPreset: 'code' }),
+    sessionSelectModel: vi.fn().mockResolvedValue({ selected: { provider: 'deepseek-official', model: 'deepseek-v4-flash' } }),
+    sessionPrompt: vi.fn().mockResolvedValue({ accepted: true }),
+    sessionUpdateQueue: vi.fn().mockResolvedValue({ accepted: true }),
+    sessionCancel: vi.fn().mockResolvedValue({ accepted: true }),
+    sessionRename: vi.fn().mockResolvedValue({ title: 't', seq: 0 }),
+    sessionFork: vi.fn().mockResolvedValue({ sessionId: 's3' }),
+    sessionSearch: vi.fn().mockResolvedValue({ items: [], hasMore: false }),
+    sessionModelCatalog: vi.fn().mockResolvedValue({ default: { provider: 'deepseek-official', model: 'deepseek-v4-flash' }, routableProviders: [], groups: [], failures: [] }),
+    sessionPage: vi.fn().mockResolvedValue({ records: [], hasMore: false }),
+    sessionFollow: vi.fn(),
+    sessionControl: vi.fn(),
+    skillList: vi.fn().mockResolvedValue({ skills: [] }),
+    subagentList: vi.fn().mockResolvedValue({ entries: [], parentAvailable: true }),
+    subagentPrompt: vi.fn().mockResolvedValue({ messageId: 'm1' }),
+    subagentInterrupt: vi.fn().mockResolvedValue({ accepted: true }),
+    agentPresetList: vi.fn().mockResolvedValue({ presets: [], authorable: false }),
+    agentPresetSelect: vi.fn().mockResolvedValue('standard'),
+    workspaceArchiveSession: vi.fn().mockResolvedValue({ archivedSessionIds: [] }),
+    workspaceFollow: vi.fn(),
+    remoteEvents: vi.fn(),
+    resolveRemoteEvent: vi.fn(),
+    goalCreate: vi.fn().mockResolvedValue({}),
+    goalAction: vi.fn().mockResolvedValue({}),
+    listCommands: vi.fn().mockResolvedValue([]),
+    executeCommand: vi.fn().mockResolvedValue(undefined),
   }
 
   const runtime = {
@@ -105,6 +134,7 @@ function createService(configOverride: Record<string, unknown> = {}): { service:
   const worktrees = {
     prepare: vi.fn(async () => ({ cwd: process.cwd(), isolated: false })),
     cleanupOrphans: vi.fn(async () => []),
+    recover: vi.fn(async () => []),
     // Default: s1 is an ordinary isolated session, so existing tests never
     // trigger the auto-isolation migration. The migration tests below override
     // this to simulate a host-forked session with no worktree.
@@ -131,7 +161,13 @@ function createService(configOverride: Record<string, unknown> = {}): { service:
   service.activeSessionId = 's1'
   service.summaries.set('s1', { running: false, blank: false, agentPreset: 'standard', updatedAt: 1 })
   service.client = client
-  return { service, client, persist, worktrees: worktrees as unknown as Record<string, ReturnType<typeof vi.fn>> }
+  return {
+    service,
+    client,
+    persist,
+    worktrees: worktrees as unknown as Record<string, ReturnType<typeof vi.fn>>,
+    runtime: runtime as unknown as { start: ReturnType<typeof vi.fn>; stop: ReturnType<typeof vi.fn> },
+  }
 }
 
 /** Structural view of the private gateway state the tests drive directly. */
@@ -151,8 +187,9 @@ interface GatewayTestHarness {
         failures?: unknown[]
       }
     | undefined
-  handleMux: (rpcId: RpcId, frame: MuxFrame) => void
-  handleHost: (frame: HostFrame) => void
+  handleControl: (frame: ControlFrame) => void
+  handleFollowFrame: (sessionId: string, frame: FollowFrame) => void
+  handleRemoteEvent: (event: string, args: readonly unknown[]) => void
   sendPrompt: (text: string, mode?: 'queue' | 'steer', attachments?: unknown[], configuration?: unknown, signals?: unknown) => Promise<void>
   removeQueued: (itemId: string) => Promise<void>
   steerQueued: (itemId: string) => Promise<void>
@@ -166,17 +203,16 @@ function config(reasoningEffort: string, agentPreset = 'standard'): unknown {
 
 const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0))
 
-function turnEndFrame(sessionId: string): MuxFrame {
+function turnEndFrame(sessionId: string): FollowFrame {
   return {
-    type: 'session/event',
-    sessionId,
+    type: 'event',
     event: { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } }, time: 10, seq: 10 },
-  } as unknown as MuxFrame
+  } as unknown as FollowFrame
 }
 
 function idleBoundary(service: GatewayTestHarness): void {
-  service.handleHost({ type: 'host/session-status', sessionId: 's1', running: false } as unknown as HostFrame)
-  service.handleMux('rpc-boundary' as unknown as RpcId, turnEndFrame('s1'))
+  service.handleRemoteEvent('api-session/status', ['s1', false])
+  service.handleFollowFrame('s1', turnEndFrame('s1'))
 }
 
 describe('gateway staged configuration', () => {
@@ -185,9 +221,9 @@ describe('gateway staged configuration', () => {
 
     await service.sendPrompt('hello', 'queue', [], config('max'))
 
-    expect(client.sessions.selectModel).toHaveBeenCalledTimes(1)
-    expect(client.sessions.selectModel).toHaveBeenCalledWith(expect.objectContaining({ reasoningEffort: 'max' }))
-    expect(client.sessions.prompt).toHaveBeenCalledTimes(1)
+    expect(client.sessionSelectModel).toHaveBeenCalledTimes(1)
+    expect(client.sessionSelectModel).toHaveBeenCalledWith(expect.objectContaining({ reasoningEffort: 'max' }))
+    expect(client.sessionPrompt).toHaveBeenCalledTimes(1)
     expect(service.pendingQueue.pending.size).toBe(0)
     // The optimistic admission marker is set until the turn events arrive.
     expect(service.pendingQueue.admitted.has('s1')).toBe(true)
@@ -199,8 +235,8 @@ describe('gateway staged configuration', () => {
 
     await service.sendPrompt('queued', 'queue', [], config('max'))
 
-    expect(client.sessions.selectModel).not.toHaveBeenCalled()
-    expect(client.sessions.prompt).toHaveBeenCalledTimes(1)
+    expect(client.sessionSelectModel).not.toHaveBeenCalled()
+    expect(client.sessionPrompt).toHaveBeenCalledTimes(1)
     expect(service.pendingQueue.pending.get('s1')).toHaveLength(1)
   })
 
@@ -217,10 +253,10 @@ describe('gateway staged configuration', () => {
 
     // The image admission check runs at enqueue time against the live
     // selection, so the staged switch to deepseek-v4-flash must land first.
-    expect(client.sessions.selectModel).toHaveBeenCalledTimes(1)
-    expect(client.sessions.selectModel).toHaveBeenCalledWith(expect.objectContaining({ model: 'deepseek-v4-flash' }))
+    expect(client.sessionSelectModel).toHaveBeenCalledTimes(1)
+    expect(client.sessionSelectModel).toHaveBeenCalledWith(expect.objectContaining({ model: 'deepseek-v4-flash' }))
     expect(service.pendingQueue.pending.size).toBe(0)
-    expect(client.sessions.prompt).toHaveBeenCalledTimes(1)
+    expect(client.sessionPrompt).toHaveBeenCalledTimes(1)
   })
 
   it('still parks the configuration when a queued image prompt keeps the model', async () => {
@@ -236,7 +272,7 @@ describe('gateway staged configuration', () => {
     // to move, so the effort-only change keeps riding the pending queue.
     await service.sendPrompt('queued', 'queue', [image], config('max'))
 
-    expect(client.sessions.selectModel).not.toHaveBeenCalled()
+    expect(client.sessionSelectModel).not.toHaveBeenCalled()
     expect(service.pendingQueue.pending.get('s1')).toHaveLength(1)
   })
 
@@ -244,13 +280,13 @@ describe('gateway staged configuration', () => {
     const { service, client } = createService()
     service.summaries.set('s1', { running: true, blank: false, agentPreset: 'standard', updatedAt: 1 })
     await service.sendPrompt('queued', 'queue', [], config('max'))
-    expect(client.sessions.selectModel).not.toHaveBeenCalled()
+    expect(client.sessionSelectModel).not.toHaveBeenCalled()
 
     idleBoundary(service)
     await tick()
 
-    expect(client.sessions.selectModel).toHaveBeenCalledTimes(1)
-    expect(client.sessions.selectModel).toHaveBeenCalledWith(expect.objectContaining({ reasoningEffort: 'max' }))
+    expect(client.sessionSelectModel).toHaveBeenCalledTimes(1)
+    expect(client.sessionSelectModel).toHaveBeenCalledWith(expect.objectContaining({ reasoningEffort: 'max' }))
     expect(service.pendingQueue.pending.size).toBe(0)
   })
 
@@ -258,13 +294,13 @@ describe('gateway staged configuration', () => {
     const { service, client } = createService()
     service.summaries.set('s1', { running: true, blank: false, agentPreset: 'standard', updatedAt: 1 })
     await service.sendPrompt('queued', 'queue', [], config('max'))
-    client.sessions.selectModel.mockRejectedValueOnce(new Error('transient'))
+    client.sessionSelectModel.mockRejectedValueOnce(new Error('transient'))
 
     idleBoundary(service)
     await tick()
     expect(service.pendingQueue.pending.get('s1')).toHaveLength(1)
 
-    client.sessions.selectModel.mockResolvedValueOnce({ result: { ok: true, value: { selected: {} } } })
+    client.sessionSelectModel.mockResolvedValueOnce({ selected: { } })
     idleBoundary(service)
     await tick()
     expect(service.pendingQueue.pending.size).toBe(0)
@@ -283,7 +319,7 @@ describe('gateway staged configuration', () => {
     idleBoundary(service)
     await tick()
 
-    expect(client.sessions.selectModel.mock.calls.map((call) => call[0].reasoningEffort)).toEqual(['max', 'low'])
+    expect(client.sessionSelectModel.mock.calls.map((call) => call[0].reasoningEffort)).toEqual(['max', 'low'])
     expect(service.pendingQueue.pending.size).toBe(0)
   })
 
@@ -292,24 +328,22 @@ describe('gateway staged configuration', () => {
     service.summaries.set('s1', { running: false, blank: false, agentPreset: 'standard', updatedAt: 1 })
 
     await service.sendPrompt('first', 'queue', [], config('high'))
-    expect(client.sessions.selectModel).toHaveBeenCalledTimes(1)
+    expect(client.sessionSelectModel).toHaveBeenCalledTimes(1)
 
     // No turn events have arrived yet; the optimistic marker must force the
     // second prompt's configuration onto the deferred path.
     await service.sendPrompt('second', 'queue', [], config('low'))
-    expect(client.sessions.selectModel).toHaveBeenCalledTimes(1)
-    expect(client.sessions.prompt).toHaveBeenCalledTimes(2)
+    expect(client.sessionSelectModel).toHaveBeenCalledTimes(1)
+    expect(client.sessionPrompt).toHaveBeenCalledTimes(2)
     expect(service.pendingQueue.pending.get('s1')).toHaveLength(1)
   })
 
   it('keeps carry-over ahead of the prompt when a mode switch creates a session', async () => {
     const { service, client } = createService()
-    client.sessions.list.mockResolvedValue({ result: { ok: true, value: {
-      items: [
-        { sessionId: 's1', running: false, blank: false, agentPreset: 'standard', updatedAt: 1 },
-        { sessionId: 's2', running: false, blank: true, agentPreset: 'code', updatedAt: 2 },
-      ],
-    } } })
+    client.sessionList.mockResolvedValue([
+      { sessionId: 's1', running: false, blank: false, agentPreset: 'standard', updatedAt: 1 },
+      { sessionId: 's2', running: false, blank: true, agentPreset: 'code', updatedAt: 2 },
+    ])
     service.summaries.set('s1', { running: false, blank: false, agentPreset: 'standard', updatedAt: 1 })
     service.entries = [{ event: {
       type: 'user/message',
@@ -318,7 +352,7 @@ describe('gateway staged configuration', () => {
 
     await service.sendPrompt('continue', 'queue', [], config('max', 'code'))
 
-    const request = client.sessions.prompt.mock.calls.at(-1)?.[0] as { sessionId: string; content: Array<{ type: string; text?: string }> }
+    const request = client.sessionPrompt.mock.calls.at(-1)?.[0] as { sessionId: string; content: Array<{ type: string; text?: string }> }
     expect(request.sessionId).toBe('s2')
     expect(request.content[0]?.text).toContain('<context-carry')
     expect(request.content.at(-1)?.text).toBe('continue')
@@ -328,7 +362,7 @@ describe('gateway staged configuration', () => {
   it('rolls back the pending slot when admission fails', async () => {
     const { service, client } = createService()
     service.summaries.set('s1', { running: true, blank: false, agentPreset: 'standard', updatedAt: 1 })
-    client.sessions.prompt.mockResolvedValueOnce({ result: { ok: false, error: { message: 'boom' } } })
+    client.sessionPrompt.mockRejectedValueOnce(new Error('boom'))
 
     await expect(service.sendPrompt('queued', 'queue', [], config('max'))).rejects.toThrow('boom')
 
@@ -345,7 +379,7 @@ describe('gateway staged configuration', () => {
     idleBoundary(service)
     await tick()
 
-    expect(client.sessions.selectModel).not.toHaveBeenCalled()
+    expect(client.sessionSelectModel).not.toHaveBeenCalled()
     expect(service.pendingQueue.pending.size).toBe(0)
   })
 
@@ -374,7 +408,7 @@ describe('gateway staged configuration', () => {
     service.metaStore.effortIntents.set('s1', 'auto')
     service.metaStore.metaBySession.set('s1', { pinned: true })
 
-    service.handleHost({ type: 'host/session-removed', sessionId: 's1' } as unknown as HostFrame)
+    service.handleRemoteEvent('api-session/removed', ['s1'])
     await tick()
 
     expect(service.metaStore.effortIntents.has('s1')).toBe(false)
@@ -406,7 +440,7 @@ describe('gateway auto model matching', () => {
 
     await service.sendPrompt('very large task', 'queue', [], config('auto'), { promptTokens: 12_000, attachmentCount: 0 })
 
-    expect(client.sessions.selectModel).toHaveBeenCalledWith(expect.objectContaining({ model: 'deepseek-v4-pro' }))
+    expect(client.sessionSelectModel).toHaveBeenCalledWith(expect.objectContaining({ model: 'deepseek-v4-pro' }))
   })
 
   it('keeps the fast model for a light auto prompt', async () => {
@@ -415,7 +449,7 @@ describe('gateway auto model matching', () => {
 
     await service.sendPrompt('hi', 'queue', [], config('auto'), { promptTokens: 100, attachmentCount: 0 })
 
-    expect(client.sessions.selectModel).toHaveBeenCalledWith(expect.objectContaining({ model: 'deepseek-v4-flash' }))
+    expect(client.sessionSelectModel).toHaveBeenCalledWith(expect.objectContaining({ model: 'deepseek-v4-flash' }))
   })
 
   it('resolves the auto tier against the chosen model, not the staged one', async () => {
@@ -426,7 +460,7 @@ describe('gateway auto model matching', () => {
     // resolved reasoning effort must come from pro's options ('max').
     await service.sendPrompt('big', 'queue', [], config('auto'), { promptTokens: 9_000, attachmentCount: 1 })
 
-    expect(client.sessions.selectModel).toHaveBeenCalledWith(expect.objectContaining({
+    expect(client.sessionSelectModel).toHaveBeenCalledWith(expect.objectContaining({
       model: 'deepseek-v4-pro',
       reasoningEffort: 'max',
     }))
@@ -438,7 +472,7 @@ describe('gateway auto model matching', () => {
 
     await service.sendPrompt('hello', 'queue', [], config('auto'))
 
-    expect(client.sessions.selectModel).toHaveBeenCalledWith(expect.objectContaining({ model: 'deepseek-v4-flash' }))
+    expect(client.sessionSelectModel).toHaveBeenCalledWith(expect.objectContaining({ model: 'deepseek-v4-flash' }))
   })
 })
 
@@ -449,17 +483,17 @@ describe('gateway auto-isolation of host-forked sessions', () => {
     // worktree record (uuid id, inherited shared cwd).
     vi.mocked(worktrees.recordFor!).mockReturnValue(undefined)
     // createSession() rebuilds the summary map from sessions.list.
-    client.sessions.list.mockResolvedValue({
-      result: { ok: true, value: { items: [{ sessionId: 's2', agentPreset: 'standard' }] } },
-    })
+    client.sessionList.mockResolvedValue([
+      { sessionId: 's2', running: false, blank: true, agentPreset: 'standard', updatedAt: 2 },
+    ])
 
     await service.sendPrompt('hello', 'queue', [])
 
     // The conversation moved: a fresh session was created (createSession) and
     // the prompt was admitted against the new isolated session.
-    expect(client.sessions.create).toHaveBeenCalledTimes(1)
+    expect(client.sessionCreate).toHaveBeenCalledTimes(1)
     expect(service.activeSessionId).toBe('s2')
-    expect(client.sessions.prompt).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 's2' }))
+    expect(client.sessionPrompt).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 's2' }))
   })
 
   it('skips auto-isolation when the shared checkout has uncommitted changes', async () => {
@@ -471,9 +505,9 @@ describe('gateway auto-isolation of host-forked sessions', () => {
       await service.sendPrompt('hello', 'queue', [])
 
       // Dirty checkout: migration would strand its changes outside the worktree.
-      expect(client.sessions.create).not.toHaveBeenCalled()
+      expect(client.sessionCreate).not.toHaveBeenCalled()
       expect(service.activeSessionId).toBe('s1')
-      expect(client.sessions.prompt).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 's1' }))
+      expect(client.sessionPrompt).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 's1' }))
     } finally {
       ;(vscode.workspace as { workspaceFolders: unknown }).workspaceFolders = undefined
     }
@@ -485,9 +519,9 @@ describe('gateway auto-isolation of host-forked sessions', () => {
 
     await service.sendPrompt('hello', 'queue', [])
 
-    expect(client.sessions.create).not.toHaveBeenCalled()
+    expect(client.sessionCreate).not.toHaveBeenCalled()
     expect(service.activeSessionId).toBe('s1')
-    expect(client.sessions.prompt).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 's1' }))
+    expect(client.sessionPrompt).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 's1' }))
   })
 })
 
@@ -496,7 +530,7 @@ describe('gateway worktree auto-merge', () => {
     const { service, worktrees } = createService({ worktreeAutoMerge: 'onTurnEnd' })
     vi.mocked(worktrees.mergeBack!).mockResolvedValue({ ok: true, message: 'merged' })
 
-    service.handleMux('rpc-auto-merge' as unknown as RpcId, turnEndFrame('s1'))
+    service.handleFollowFrame('s1', turnEndFrame('s1'))
     await tick()
     await tick()
 
@@ -507,7 +541,7 @@ describe('gateway worktree auto-merge', () => {
   it('keeps the worktree untouched on turn/end when worktreeAutoMerge is never', async () => {
     const { service, worktrees } = createService({ worktreeAutoMerge: 'never' })
 
-    service.handleMux('rpc-auto-merge' as unknown as RpcId, turnEndFrame('s1'))
+    service.handleFollowFrame('s1', turnEndFrame('s1'))
     await tick()
 
     expect(worktrees.mergeBack).not.toHaveBeenCalled()
@@ -517,7 +551,7 @@ describe('gateway worktree auto-merge', () => {
     const { service, worktrees } = createService()
     vi.mocked(worktrees.mergeBack!).mockResolvedValue({ ok: true, message: 'merged' })
 
-    service.handleMux('rpc-auto-merge' as unknown as RpcId, turnEndFrame('s1'))
+    service.handleFollowFrame('s1', turnEndFrame('s1'))
     await tick()
     await tick()
 
@@ -528,7 +562,7 @@ describe('gateway worktree auto-merge', () => {
     const { service, worktrees } = createService({ worktreeAutoMerge: 'onTurnEnd' })
     vi.mocked(worktrees.recordFor!).mockReturnValue(undefined)
 
-    service.handleMux('rpc-auto-merge' as unknown as RpcId, turnEndFrame('s1'))
+    service.handleFollowFrame('s1', turnEndFrame('s1'))
     await tick()
 
     expect(worktrees.mergeBack).not.toHaveBeenCalled()
@@ -545,8 +579,8 @@ describe('gateway worktree auto-merge', () => {
     })
 
     // Two adjacent turn/end events arrive before the first merge settles.
-    service.handleMux('rpc-a' as unknown as RpcId, turnEndFrame('s1'))
-    service.handleMux('rpc-b' as unknown as RpcId, turnEndFrame('s1'))
+    service.handleFollowFrame('s1', turnEndFrame('s1'))
+    service.handleFollowFrame('s1', turnEndFrame('s1'))
     await tick()
     expect(calls).toBe(1)
 
@@ -571,38 +605,36 @@ describe('gateway steerQueued (send now)', () => {
 
     await service.steerQueued('q1')
 
-    expect(client.sessions.updateQueue).toHaveBeenCalledWith(expect.objectContaining({ itemId: 'q1', action: { kind: 'steer' } }))
-    expect(client.sessions.prompt).not.toHaveBeenCalled()
+    expect(client.sessionUpdateQueue).toHaveBeenCalledWith(expect.objectContaining({ itemId: 'q1', action: { kind: 'steer' } }))
+    expect(client.sessionPrompt).not.toHaveBeenCalled()
   })
 
   it('silently ignores an item the turn already claimed', async () => {
     const { service, client } = createService()
     service.queue = [queueItem('q1')]
-    vi.mocked(client.sessions.updateQueue).mockResolvedValueOnce({
-      result: { ok: false, error: { code: 'queue-item-not-found', message: 'already claimed' } },
-    } as never)
+    vi.mocked(client.sessionUpdateQueue).mockRejectedValueOnce(
+      Object.assign(new Error('already claimed'), { code: 'queue-item-not-found' }),
+    )
 
     await expect(service.steerQueued('q1')).resolves.toBeUndefined()
 
-    expect(client.sessions.prompt).not.toHaveBeenCalled()
+    expect(client.sessionPrompt).not.toHaveBeenCalled()
   })
 
   it('interrupts a running turn with a steer prompt when the queue steer is refused', async () => {
     const { service, client } = createService()
     service.queue = [queueItem('q1')]
-    vi.mocked(client.sessions.updateQueue)
-      .mockResolvedValueOnce({
-        result: { ok: false, error: { code: 'steer-unavailable', message: 'no longer steerable' } },
-      } as never)
-      .mockResolvedValueOnce({ result: { ok: true, value: { accepted: true } } } as never)
-    vi.mocked(client.sessions.prompt).mockResolvedValueOnce({
-      result: { ok: true, value: { accepted: true } },
-    } as never)
+    vi.mocked(client.sessionUpdateQueue)
+      .mockRejectedValueOnce(
+        Object.assign(new Error('no longer steerable'), { code: 'steer-unavailable' }),
+      )
+      .mockResolvedValueOnce({ accepted: true } as never)
+    vi.mocked(client.sessionPrompt).mockResolvedValueOnce({ accepted: true } as never)
 
     await service.steerQueued('q1')
 
-    expect(client.sessions.prompt).toHaveBeenCalledTimes(1)
-    expect(client.sessions.prompt).toHaveBeenCalledWith(expect.objectContaining({
+    expect(client.sessionPrompt).toHaveBeenCalledTimes(1)
+    expect(client.sessionPrompt).toHaveBeenCalledWith(expect.objectContaining({
       mode: 'steer',
       content: [{ type: 'text', text: 'hello' }],
     }))
@@ -611,34 +643,78 @@ describe('gateway steerQueued (send now)', () => {
   it('falls back to a queued prompt when the idle agent refuses steering', async () => {
     const { service, client } = createService()
     service.queue = [queueItem('q1')]
-    vi.mocked(client.sessions.updateQueue)
-      .mockResolvedValueOnce({
-        result: { ok: false, error: { code: 'steer-unavailable', message: 'idle' } },
-      } as never)
-      .mockResolvedValueOnce({ result: { ok: true, value: { accepted: true } } } as never)
-    vi.mocked(client.sessions.prompt)
-      .mockResolvedValueOnce({
-        result: { ok: false, error: { code: 'agent-busy', message: 'prompt rejected' } },
-      } as never)
-      .mockResolvedValueOnce({ result: { ok: true, value: { accepted: true } } } as never)
+    vi.mocked(client.sessionUpdateQueue)
+      .mockRejectedValueOnce(
+        Object.assign(new Error('idle'), { code: 'steer-unavailable' }),
+      )
+      .mockResolvedValueOnce({ accepted: true } as never)
+    vi.mocked(client.sessionPrompt)
+      .mockRejectedValueOnce(Object.assign(new Error('prompt rejected'), { code: 'agent-busy' }))
+      .mockResolvedValueOnce({ accepted: true } as never)
 
     await service.steerQueued('q1')
 
-    expect(client.sessions.prompt).toHaveBeenCalledTimes(2)
-    expect(client.sessions.prompt).toHaveBeenNthCalledWith(1, expect.objectContaining({ mode: 'steer' }))
-    expect(client.sessions.prompt).toHaveBeenNthCalledWith(2, expect.objectContaining({ mode: 'queue' }))
+    expect(client.sessionPrompt).toHaveBeenCalledTimes(2)
+    expect(client.sessionPrompt).toHaveBeenNthCalledWith(1, expect.objectContaining({ mode: 'steer' }))
+    expect(client.sessionPrompt).toHaveBeenNthCalledWith(2, expect.objectContaining({ mode: 'queue' }))
   })
 
   it('keeps the original error for image items instead of re-submitting them', async () => {
     const { service, client } = createService()
     service.queue = [queueItem('q1', 'hello', true)]
-    vi.mocked(client.sessions.updateQueue).mockResolvedValueOnce({
-      result: { ok: false, error: { code: 'steer-unavailable', message: 'no longer steerable' } },
-    } as never)
+    vi.mocked(client.sessionUpdateQueue).mockRejectedValueOnce(
+      Object.assign(new Error('no longer steerable'), { code: 'steer-unavailable' }),
+    )
 
     await expect(service.steerQueued('q1')).rejects.toThrow('no longer steerable')
 
-    expect(client.sessions.updateQueue).toHaveBeenCalledTimes(1)
-    expect(client.sessions.prompt).not.toHaveBeenCalled()
+    expect(client.sessionUpdateQueue).toHaveBeenCalledTimes(1)
+    expect(client.sessionPrompt).not.toHaveBeenCalled()
+  })
+})
+
+describe('start baseline watchdog', () => {
+  /** Lets start() drive the real baseline against the stub client. */
+  function wireClient(service: GatewayTestHarness, client: TestClient): void {
+    (service as unknown as { createGatewayClient: () => unknown }).createGatewayClient = () => client
+  }
+
+  it('does not consume the baseline budget while the runtime is still booting', async () => {
+    vi.useFakeTimers()
+    try {
+      const { service, client, runtime } = createService()
+      // A slow first boot after an extension update: the process announces its
+      // URL only 60s in — past the old 45s whole-start watchdog.
+      runtime.start.mockImplementation(
+        () => new Promise((resolve) => setTimeout(() => resolve('http://127.0.0.1:0'), 60_000)),
+      )
+      wireClient(service, client)
+
+      const started = (service as unknown as { start(): Promise<void> }).start()
+      await vi.advanceTimersByTimeAsync(95_000)
+      await started
+
+      expect(client.probe).toHaveBeenCalled()
+      expect(runtime.stop).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('stops the runtime when a baseline RPC hangs past the deadline', async () => {
+    vi.useFakeTimers()
+    try {
+      const { service, client, runtime } = createService()
+      client.probe.mockImplementation(() => new Promise(() => undefined))
+      wireClient(service, client)
+
+      const started = (service as unknown as { start(): Promise<void> }).start()
+      await vi.advanceTimersByTimeAsync(50_000)
+      await started
+
+      expect(runtime.stop).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

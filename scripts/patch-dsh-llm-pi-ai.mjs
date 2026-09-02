@@ -7,7 +7,7 @@ const packageJsonPath = require.resolve('@deepseek-ai/dsh-llm-pi-ai/package.json
 const packageRoot = dirname(packageJsonPath)
 const packageJson = JSON.parse(await readFile(packageJsonPath, 'utf8'))
 
-const SUPPORTED_VERSIONS = ['0.1.1-rc.1', '0.1.1-rc.2']
+const SUPPORTED_VERSIONS = ['0.1.1-rc.1', '0.1.1-rc.2', '0.1.2-alpha.4']
 
 if (!SUPPORTED_VERSIONS.includes(packageJson.version)) {
   throw new Error(
@@ -63,7 +63,9 @@ const toolReplayNormalization = `
 `
 
 // 0.1.1-rc.1 calls toPiContext in one line; 0.1.1-rc.2 spreads options with
-// the watchdog signal and passes the route's image policy.
+// the watchdog signal and passes the route's image policy; 0.1.2-alpha.4
+// moved the image payload into a second options object keyed with
+// attachments/resolveImageAccess/maxRequestImageBytes/requestImagePolicy.
 const RC1_CONTEXT_CALL = 'attachments === void 0 ? toPiContext(options, void 0, onReplayDegrade) : await toPiContext(options, attachments, onReplayDegrade, profile.maxRequestImageBytes);'
 const RC2_CONTEXT_CALL = `attachments === void 0 ? toPiContext(options, void 0, onReplayDegrade) : await toPiContext({
 \t\t\t\t\t...options,
@@ -72,11 +74,23 @@ const RC2_CONTEXT_CALL = `attachments === void 0 ? toPiContext(options, void 0, 
 \t\t\t\t\tmaxPixels: profile.requestImagePixelBudget,
 \t\t\t\t\tmaxBytes: profile.requestImageMaxBytes
 \t\t\t\t});`
+const ALPHA4_CONTEXT_CALL = `attachments === void 0 ? toPiContext(options, void 0, onReplayDegrade) : await toPiContext({
+\t\t\t\t\t...options,
+\t\t\t\t\tsignal: watchdog.signal
+\t\t\t\t}, {
+\t\t\t\t\tattachments,
+\t\t\t\t\tresolveImageAccess: (ref) => this.config.resolveImageAccess?.(attachments, ref),
+\t\t\t\t\tmaxRequestImageBytes: profile.maxRequestImageBytes,
+\t\t\t\t\trequestImagePolicy: {
+\t\t\t\t\t\tmaxPixels: profile.requestImagePixelBudget,
+\t\t\t\t\t\tmaxBytes: profile.requestImageMaxBytes
+\t\t\t\t\t}
+\t\t\t\t}, onReplayDegrade);`
 
 const runtimeChanged = await patchFile('lib/index.js', [
   {
     label: 'cross-provider DeepSeek tool replay',
-    candidates: [RC2_CONTEXT_CALL, RC1_CONTEXT_CALL].map((call) => ({
+    candidates: [ALPHA4_CONTEXT_CALL, RC2_CONTEXT_CALL, RC1_CONTEXT_CALL].map((call) => ({
       before: `\t\t\t\tconst context = ${call}\n\t\t\t\tconst iterator = toStreamChunks(snapshot.models.streamSimple(model, context, {`,
       after: `\t\t\t\tconst rawContext = ${call}${toolReplayNormalization}\t\t\t\tconst iterator = toStreamChunks(snapshot.models.streamSimple(model, context, {`,
     })),

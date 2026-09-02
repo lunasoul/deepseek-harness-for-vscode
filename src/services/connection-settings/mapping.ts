@@ -4,11 +4,9 @@
  * small object guards they share. Stateless — the service class in
  * `../connection-settings-service.ts` drives these with a live client.
  */
-import type {
-  ConfigurableProviderView,
-  SettingsNamespaceView,
-} from '@deepseek-ai/dsh-host-apiproxy/api'
-import type { IApiClient } from '@deepseek-ai/dsh-client-connection/client'
+import type { LlmConfigurableProvider as ConfigurableProviderView } from '@deepseek-ai/dsh-llm/types'
+import type { SettingsNamespaceView } from '@deepseek-ai/dsh-settings/types'
+import type { NodeGatewayClient } from '../../gateway/node-gateway-client.js'
 import { validateBaseUrl } from '../../domain/base-url.js'
 import { modelCapacity } from '../../domain/model-capacity.js'
 import { supportsImageInput } from '../../domain/model-modalities.js'
@@ -28,7 +26,11 @@ export const PI_AI_SETTINGS_NS = 'llm-pi-ai'
 export const DEEPSEEK_SETTINGS_NS = 'llm-deepseek'
 
 /** The slice of the API client the settings adapter talks to. */
-export type ProviderControlClient = Pick<IApiClient, 'settings' | 'credentials' | 'llm'>
+export type ProviderControlClient = Pick<NodeGatewayClient,
+  | 'settingsDescribe' | 'settingsMutate'
+  | 'credentialsDescribe' | 'credentialsSet' | 'credentialsUnset'
+  | 'llmListProviders' | 'llmListConfigurableProviders' | 'llmDiscoverModels'
+  | 'sessionModelCatalog'>
 
 /** Reads `{ result: { ok: true, value } | { ok: false, error } }` envelopes. */
 export function valueOf<T>(response: { readonly result: { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: { readonly message: string } } }): T {
